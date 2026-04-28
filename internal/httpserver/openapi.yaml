@@ -1,0 +1,665 @@
+openapi: 3.0.3
+info:
+  title: GTFS Mobile API
+  version: 1.0.0
+  description: |
+    Thin Go layer over Supabase GTFS static + realtime data.
+    All responses follow the envelope `{ status, data, meta? }`.
+    `status.mode` becomes `static_only` if the GTFS realtime feed has not synced recently.
+servers:
+  - url: http://localhost:8080
+  - url: https://localhost:8443
+tags:
+  - name: Health
+  - name: Auth
+  - name: Stops
+  - name: Routes
+  - name: Trips
+  - name: Calendar
+  - name: Realtime
+
+paths:
+  /healthz:
+    get:
+      tags: [Health]
+      summary: Health check
+      responses:
+        "200":
+          description: OK
+
+  /v1/auth/signup:
+    post:
+      tags: [Auth]
+      summary: Sign up a user with Supabase Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthRequest"
+      responses:
+        "200":
+          description: Signup response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login a user with Supabase Auth password grant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AuthRequest"
+      responses:
+        "200":
+          description: Login response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid credentials or request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/auth/verify-otp:
+    post:
+      tags: [Auth]
+      summary: Verify email OTP for signup or email flows
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyOTPRequest"
+      responses:
+        "200":
+          description: Verification response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid token/type
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/gtfs/stops:
+    get:
+      tags: [Stops]
+      summary: Search stops by text and/or geo
+      parameters:
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: lat
+          schema: { type: number, format: double }
+        - in: query
+          name: lon
+          schema: { type: number, format: double }
+        - in: query
+          name: radius
+          description: Radius in meters
+          schema: { type: integer, minimum: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StopSummaryListResponse" }
+
+  /v1/gtfs/stops/{stopId}:
+    get:
+      tags: [Stops]
+      summary: Get stop details
+      parameters:
+        - in: path
+          name: stopId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StopResponse" }
+        "404":
+          description: Not found
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/gtfs/stops/{stopId}/departures:
+    get:
+      tags: [Stops]
+      summary: Departures at a stop
+      parameters:
+        - in: path
+          name: stopId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: at
+          description: ISO 8601 timestamp (defaults to now)
+          schema: { type: string, format: date-time }
+        - in: query
+          name: windowMinutes
+          schema: { type: integer, minimum: 1, maximum: 360 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 50 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/DeparturesResponse" }
+
+  /v1/gtfs/routes:
+    get:
+      tags: [Routes]
+      summary: Search routes
+      parameters:
+        - in: query
+          name: search
+          schema: { type: string }
+        - in: query
+          name: type
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500 }
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoutesResponse" }
+
+  /v1/gtfs/routes/{routeId}:
+    get:
+      tags: [Routes]
+      summary: Get route details
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RouteResponse" }
+        "404":
+          description: Not found
+
+  /v1/gtfs/routes/{routeId}/stops:
+    get:
+      tags: [Routes]
+      summary: Stops served by a route
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: directionId
+          schema: { type: string, enum: ["0", "1"] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StopSummaryListResponse" }
+
+  /v1/gtfs/routes/{routeId}/directions:
+    get:
+      tags: [Routes]
+      summary: Directions available for a route
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RouteDirectionsResponse" }
+
+  /v1/gtfs/routes/{routeId}/shape:
+    get:
+      tags: [Routes]
+      summary: Polyline points for most common route shape
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: directionId
+          schema: { type: string, enum: ["0", "1"] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RouteShapeResponse" }
+        "404":
+          description: Not found
+
+  /v1/gtfs/trips:
+    get:
+      tags: [Trips]
+      summary: List trips by route and service date
+      parameters:
+        - in: query
+          name: routeId
+          schema: { type: string }
+        - in: query
+          name: serviceDate
+          description: YYYY-MM-DD (defaults to today)
+          schema: { type: string }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 1000 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TripsResponse" }
+
+  /v1/gtfs/trips/{tripId}:
+    get:
+      tags: [Trips]
+      summary: Get trip details
+      parameters:
+        - in: path
+          name: tripId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TripResponse" }
+        "404":
+          description: Not found
+
+  /v1/gtfs/trips/{tripId}/stop-times:
+    get:
+      tags: [Trips]
+      summary: Stop times for a trip
+      parameters:
+        - in: path
+          name: tripId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TripStopTimesResponse" }
+
+  /v1/gtfs/calendar/service:
+    get:
+      tags: [Calendar]
+      summary: Active services on a date
+      parameters:
+        - in: query
+          name: date
+          description: YYYY-MM-DD (defaults to today)
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ServiceCalendarResponse" }
+
+  /v1/gtfs/calendar/exceptions:
+    get:
+      tags: [Calendar]
+      summary: Calendar exceptions in a date range
+      parameters:
+        - in: query
+          name: from
+          required: true
+          schema: { type: string }
+        - in: query
+          name: to
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarExceptionsResponse" }
+
+  /v1/map/vehicles:
+    get:
+      tags: [Realtime]
+      summary: Active vehicle positions
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/VehiclesResponse" }
+
+components:
+  schemas:
+    APIStatus:
+      type: object
+      required: [mode]
+      properties:
+        mode: { type: string, enum: [normal, static_only] }
+        last_successful_sync: { type: string, format: date-time, nullable: true }
+
+    Meta:
+      type: object
+      properties:
+        total: { type: integer }
+        limit: { type: integer }
+        service_date: { type: string }
+
+    StopSummary:
+      type: object
+      required: [stop_id, lat, lon]
+      properties:
+        stop_id: { type: string }
+        stop_name: { type: string }
+        stop_code: { type: string }
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+
+    Stop:
+      type: object
+      required: [stop_id]
+      properties:
+        stop_id: { type: string }
+        stop_code: { type: string }
+        stop_name: { type: string }
+        stop_desc: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        zone_id: { type: string }
+        location_type: { type: string }
+        parent_station: { type: string }
+        wheelchair_boarding: { type: string }
+        platform_code: { type: string }
+
+    Route:
+      type: object
+      required: [route_id]
+      properties:
+        route_id: { type: string }
+        agency_id: { type: string }
+        short_name: { type: string }
+        long_name: { type: string }
+        route_type: { type: string }
+        route_color: { type: string }
+        route_text_color: { type: string }
+
+    RouteShapePoint:
+      type: object
+      required: [sequence, lat, lon]
+      properties:
+        sequence: { type: integer }
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+
+    RouteShape:
+      type: object
+      required: [route_id, shape_id, points]
+      properties:
+        route_id: { type: string }
+        shape_id: { type: string }
+        points:
+          type: array
+          items: { $ref: "#/components/schemas/RouteShapePoint" }
+
+    RouteDirection:
+      type: object
+      required: [direction_id, trip_count]
+      properties:
+        direction_id: { type: string, enum: ["", "0", "1"] }
+        headsign: { type: string }
+        trip_count: { type: integer }
+
+    Trip:
+      type: object
+      required: [trip_id]
+      properties:
+        trip_id: { type: string }
+        route_id: { type: string }
+        service_id: { type: string }
+        headsign: { type: string }
+        short_name: { type: string }
+        direction_id: { type: string }
+        block_id: { type: string }
+        shape_id: { type: string }
+        wheelchair_accessible: { type: string }
+        bikes_allowed: { type: string }
+
+    TripStopTime:
+      type: object
+      required: [stop_id, stop_sequence]
+      properties:
+        stop_id: { type: string }
+        stop_name: { type: string }
+        stop_sequence: { type: integer }
+        arrival_time: { type: string }
+        departure_time: { type: string }
+        stop_headsign: { type: string }
+        pickup_type: { type: string }
+        drop_off_type: { type: string }
+
+    Departure:
+      type: object
+      required: [trip_id, scheduled_time, estimated_time, is_realtime]
+      properties:
+        trip_id: { type: string }
+        route_id: { type: string }
+        route_short_name: { type: string }
+        headsign: { type: string }
+        scheduled_time: { type: string, format: date-time }
+        estimated_time: { type: string, format: date-time }
+        is_realtime: { type: boolean }
+
+    Vehicle:
+      type: object
+      required: [vehicle_id, lat, lon]
+      properties:
+        vehicle_id: { type: string }
+        trip_id: { type: string }
+        route_id: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        bearing: { type: number }
+        speed: { type: number }
+
+    ServiceCalendarDay:
+      type: object
+      properties:
+        service_id: { type: string }
+        source: { type: string, enum: [calendar, exception_added] }
+
+    CalendarException:
+      type: object
+      properties:
+        service_id: { type: string }
+        date: { type: string }
+        exception_type: { type: string }
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+
+    AuthRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string }
+        full_name: { type: string, description: "Required for signup endpoint" }
+        metadata:
+          type: object
+          additionalProperties: true
+
+    VerifyOTPRequest:
+      type: object
+      required: [token, type]
+      properties:
+        email: { type: string, format: email }
+        token: { type: string, description: "OTP or token from email" }
+        type:
+          type: string
+          enum: [signup, email, recovery, magiclink, email_change]
+
+    AuthResponse:
+      type: object
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        token_type: { type: string }
+        expires_in: { type: integer }
+        user:
+          type: object
+          additionalProperties: true
+
+    StopSummaryListResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/StopSummary" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    StopResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/Stop" }
+
+    DeparturesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Departure" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    RoutesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Route" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    RouteResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/Route" }
+
+    RouteShapeResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/RouteShape" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    RouteDirectionsResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/RouteDirection" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    TripsResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Trip" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    TripResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/Trip" }
+
+    TripStopTimesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/TripStopTime" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    ServiceCalendarResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/ServiceCalendarDay" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    CalendarExceptionsResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/CalendarException" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    VehiclesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/Vehicle" }
+        meta: { $ref: "#/components/schemas/Meta" }
