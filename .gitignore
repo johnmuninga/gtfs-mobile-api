@@ -1,0 +1,28 @@
+# Environment/local secrets
+.env
+.env.local
+.env.*.local
+
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.txt
+
+# Local TLS certs
+certs/
+
+# Logs
+*.log
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
