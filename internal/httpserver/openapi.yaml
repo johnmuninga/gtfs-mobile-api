@@ -7,9 +7,13 @@ info:
     All responses follow the envelope `{ status, data, meta? }`.
     `status.mode` becomes `static_only` if the GTFS realtime feed has not synced recently.
 
-    **Authentication:** Every endpoint requires a Supabase JWT in `Authorization: Bearer <access_token>`,
+    **Authentication:** All `/v1/*` routes require a Supabase JWT in `Authorization: Bearer <access_token>`,
     except `POST /v1/auth/signup`, `POST /v1/auth/login`, and `POST /v1/auth/verify-otp` (used to obtain a token).
-    `GET /healthz` accepts the same Bearer token, or `X-Healthcheck-Secret` when `HEALTHCHECK_SECRET` is configured on the server (for probes).
+
+    `GET /`, `GET /swagger`, and `GET /openapi.yaml` are public so you can load Swagger UI, log in via those auth endpoints,
+    then click **Authorize** and paste the `access_token` returned by Supabase.
+
+    `GET /healthz` requires the same Bearer token, or `X-Healthcheck-Secret` when `HEALTHCHECK_SECRET` is configured (for probes).
 
     SQL injection is mitigated by parameterized queries in the data layer; authentication controls who can call the API.
 servers:
@@ -26,6 +30,7 @@ tags:
   - name: Feed
   - name: Realtime
   - name: Map
+  - name: Docs
 
 security:
   - bearerAuth: []
@@ -71,6 +76,25 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /swagger:
+    get:
+      tags: [Docs]
+      summary: Swagger UI (HTML)
+      description: Public page; use **Authorize** with your Supabase `access_token` to call protected APIs.
+      security: []
+      responses:
+        "200":
+          description: HTML
+
+  /openapi.yaml:
+    get:
+      tags: [Docs]
+      summary: OpenAPI specification (YAML)
+      security: []
+      responses:
+        "200":
+          description: YAML
 
   /v1/auth/signup:
     post:

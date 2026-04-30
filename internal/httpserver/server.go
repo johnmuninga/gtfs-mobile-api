@@ -1516,6 +1516,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if s.isPublicDocsRoute(r.Method, path) {
+			next.ServeHTTP(w, r)
+			return
+		}
 		if path == "/healthz" && r.Method == http.MethodGet && s.healthcheckAuthorized(r) {
 			next.ServeHTTP(w, r)
 			return
@@ -1539,6 +1543,20 @@ func (s *Server) isPublicAuthRoute(method, path string) bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// isPublicDocsRoute serves Swagger/OpenAPI HTML and YAML without a token so you can open /swagger in a browser,
+// call the public auth endpoints, then use “Authorize” with the Supabase access_token for all other operations.
+func (s *Server) isPublicDocsRoute(method, path string) bool {
+	if method != http.MethodGet {
+		return false
+	}
+	switch path {
+	case "/", "/openapi.yaml", "/swagger":
+		return true
+	default:
+		return strings.HasPrefix(path, "/swagger/")
 	}
 }
 

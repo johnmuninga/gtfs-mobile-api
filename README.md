@@ -4,13 +4,15 @@ Thin Go API layer for mobile clients that reads GTFS static + realtime data from
 
 ## Authentication
 
-All routes require `Authorization: Bearer <supabase_access_token>` except:
+All **`/v1/*`** routes require `Authorization: Bearer <supabase_access_token>` except:
 
 - `POST /v1/auth/signup`
 - `POST /v1/auth/login`
 - `POST /v1/auth/verify-otp`
 
-That includes `/healthz`, `/swagger`, and `/openapi.yaml`. Use Swagger’s **Authorize** button after logging in, or call the auth endpoints first and attach the token to every request.
+**Docs (no token):** `GET /`, `GET /swagger`, and `GET /openapi.yaml` so you can open Swagger in the browser, run login/signup, then use **Authorize** with the returned `access_token` for every other call.
+
+**Health:** `GET /healthz` still requires a Bearer token unless you configure `HEALTHCHECK_SECRET` and send `X-Healthcheck-Secret`.
 
 Optional: set `HEALTHCHECK_SECRET` in the environment so uptime checks can call `GET /healthz` with header `X-Healthcheck-Secret: <same value>` without a user JWT.
 
