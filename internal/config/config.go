@@ -15,6 +15,9 @@ type Config struct {
 	APIDegradedMinutes        int
 	NearbyDefaultRadiusMeters int
 	SnapshotRefreshMinutes    int
+	// HealthcheckSecret, if set, allows GET /healthz without a user JWT when header
+	// X-Healthcheck-Secret matches (for uptime probes). All other routes still require Bearer auth.
+	HealthcheckSecret string
 }
 
 func Load() (Config, error) {
@@ -27,6 +30,7 @@ func Load() (Config, error) {
 		APIDegradedMinutes:        getenvInt("API_DEGRADED_MINUTES", 15),
 		NearbyDefaultRadiusMeters: getenvInt("NEARBY_DEFAULT_RADIUS_METERS", 1000),
 		SnapshotRefreshMinutes:    getenvInt("SNAPSHOT_REFRESH_MINUTES", 10),
+		HealthcheckSecret:         os.Getenv("HEALTHCHECK_SECRET"),
 	}
 
 	if cfg.SupabaseDBURL == "" {

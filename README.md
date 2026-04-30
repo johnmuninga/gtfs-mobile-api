@@ -2,6 +2,20 @@
 
 Thin Go API layer for mobile clients that reads GTFS static + realtime data from Supabase and returns stripped, mobile-friendly JSON.
 
+## Authentication
+
+All routes require `Authorization: Bearer <supabase_access_token>` except:
+
+- `POST /v1/auth/signup`
+- `POST /v1/auth/login`
+- `POST /v1/auth/verify-otp`
+
+That includes `/healthz`, `/swagger`, and `/openapi.yaml`. Use Swagger’s **Authorize** button after logging in, or call the auth endpoints first and attach the token to every request.
+
+Optional: set `HEALTHCHECK_SECRET` in the environment so uptime checks can call `GET /healthz` with header `X-Healthcheck-Secret: <same value>` without a user JWT.
+
+Access control is not a substitute for safe SQL: this service uses parameterized queries against Postgres to avoid SQL injection.
+
 ## Endpoints
 
 - `GET /v1/map/vehicles` - active vehicles from `vehicle_positions_current`
@@ -34,6 +48,7 @@ Set:
 - `MAX_DB_CONNS` (default `20`)
 - `API_DEGRADED_MINUTES` (default `15`)
 - `NEARBY_DEFAULT_RADIUS_METERS` (default `1000`)
+- `HEALTHCHECK_SECRET` (optional, for `GET /healthz` probes without a user token)
 
 ## Run
 
@@ -42,7 +57,7 @@ go mod tidy
 go run ./cmd/server
 ```
 
-Then open:
+Then open Swagger (you need a Bearer token unless you use the public auth routes first):
 
 - `http://localhost:8080/swagger`
 

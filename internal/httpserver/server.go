@@ -3,6 +3,7 @@ package httpserver
 import (
 	"context"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -117,7 +118,7 @@ func (s *Server) Router() http.Handler {
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
 
-	return recoverMiddleware(gzipMiddleware(mux))
+	return recoverMiddleware(gzipMiddleware(s.authMiddleware(mux)))
 }
 
 func routeMapLite(r models.Route) models.RouteMapLite {
@@ -1497,4 +1498,58 @@ func statusCodeOr(code, fallback int) int {
 		return fallback
 	}
 	return code
+}
+
+func (s *Server) authMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodOptions {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		path := strings.TrimSuffix(r.URL.Path, "/")
+		if path == "" {
+			path = "/"
+		}
+
+		if s.isPublicAuthRoute(r.Method, path) {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if path == "/healthz" && r.Method == http.MethodGet && s.healthcheckAuthorized(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		if _, err := s.requireUserID(r.Context(), r); err != nil {
+			httpError(w, http.StatusUnauthorized, err.Error())
+			return
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) isPublicAuthRoute(method, path string) bool {
+	if method != http.MethodPost {
+		return false
+	}
+	switch path {
+	case "/v1/auth/signup", "/v1/auth/login", "/v1/auth/verify-otp":
+		return true
+	default:
+		return false
+	}
+}
+
+func (s *Server) healthcheckAuthorized(r *http.Request) bool {
+	secret := strings.TrimSpace(s.cfg.HealthcheckSecret)
+	if secret == "" {
+		return false
+	}
+	got := strings.TrimSpace(r.Header.Get("X-Healthcheck-Secret"))
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
 }

@@ -6,6 +6,12 @@ info:
     Thin Go layer over Supabase GTFS static + realtime data.
     All responses follow the envelope `{ status, data, meta? }`.
     `status.mode` becomes `static_only` if the GTFS realtime feed has not synced recently.
+
+    **Authentication:** Every endpoint requires a Supabase JWT in `Authorization: Bearer <access_token>`,
+    except `POST /v1/auth/signup`, `POST /v1/auth/login`, and `POST /v1/auth/verify-otp` (used to obtain a token).
+    `GET /healthz` accepts the same Bearer token, or `X-Healthcheck-Secret` when `HEALTHCHECK_SECRET` is configured on the server (for probes).
+
+    SQL injection is mitigated by parameterized queries in the data layer; authentication controls who can call the API.
 servers:
   - url: https://gtfs-mobile-api-production.up.railway.app
   - url: http://localhost:8080
@@ -20,6 +26,9 @@ tags:
   - name: Feed
   - name: Realtime
   - name: Map
+
+security:
+  - bearerAuth: []
 
 paths:
   /v1/feed/active:
@@ -45,13 +54,28 @@ paths:
     get:
       tags: [Health]
       summary: Health check
+      description: |
+        Requires `Authorization: Bearer <access_token>` like other routes, unless the server has `HEALTHCHECK_SECRET` set:
+        then `X-Healthcheck-Secret: <same value>` is accepted for this path only.
+      parameters:
+        - in: header
+          name: X-Healthcheck-Secret
+          required: false
+          schema: { type: string }
+          description: Probe secret when HEALTHCHECK_SECRET is configured (optional).
       responses:
         "200":
           description: OK
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
 
   /v1/auth/signup:
     post:
       tags: [Auth]
+      security: []
       summary: Sign up a user with Supabase Auth
       requestBody:
         required: true
@@ -76,6 +100,7 @@ paths:
   /v1/auth/login:
     post:
       tags: [Auth]
+      security: []
       summary: Login a user with Supabase Auth password grant
       requestBody:
         required: true
@@ -100,6 +125,7 @@ paths:
   /v1/auth/verify-otp:
     post:
       tags: [Auth]
+      security: []
       summary: Verify email OTP for signup or email flows
       requestBody:
         required: true
