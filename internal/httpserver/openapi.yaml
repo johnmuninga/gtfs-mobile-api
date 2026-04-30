@@ -12,13 +12,35 @@ servers:
 tags:
   - name: Health
   - name: Auth
+  - name: Users
   - name: Stops
   - name: Routes
   - name: Trips
   - name: Calendar
+  - name: Feed
   - name: Realtime
+  - name: Map
 
 paths:
+  /v1/feed/active:
+    get:
+      tags: [Feed]
+      summary: Feed coverage — static calendar date window + last successful sync
+      description: |
+        `calendar_window.min_date` / `max_date` span `calendar` and `calendar_dates` in the database (ISO dates).
+        Use to show “outside feed window” in the app. `status` in the envelope carries `mode` (normal / static_only).
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FeedActiveResponse" }
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
   /healthz:
     get:
       tags: [Health]
@@ -98,6 +120,67 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+
+  /v1/users/me/favorite-routes:
+    get:
+      tags: [Users]
+      summary: List my favorite routes
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FavoriteRoutesResponse" }
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+    post:
+      tags: [Users]
+      summary: Add a favorite route
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FavoriteRouteRequest" }
+      responses:
+        "200":
+          description: OK
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
+
+  /v1/users/me/favorite-routes/{routeId}:
+    delete:
+      tags: [Users]
+      summary: Remove a favorite route
+      security:
+        - bearerAuth: []
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+        "401":
+          description: Unauthorized
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorResponse" }
 
   /v1/gtfs/stops:
     get:
@@ -255,6 +338,10 @@ paths:
     get:
       tags: [Routes]
       summary: Polyline points for most common route shape
+      description: |
+        Only one `shape_id` is loaded per request (not the whole 400k-row shapes table).
+        By default vertices are capped (~2000) for small JSON and smooth map rendering.
+        Use `maxPoints=0` for full GTFS resolution (large responses).
       parameters:
         - in: path
           name: routeId
@@ -263,6 +350,11 @@ paths:
         - in: query
           name: directionId
           schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: maxPoints
+          description: |
+            Max vertices returned (50–25000). Defaults to 2000. Use 0 for no cap (all points for this shape).
+          schema: { type: integer, minimum: 0, maximum: 25000 }
       responses:
         "200":
           description: OK
@@ -328,6 +420,75 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/TripStopTimesResponse" }
 
+  /v1/gtfs/calendar/day:
+    get:
+      tags: [Calendar]
+      summary: Services running on a date (GTFS calendar + calendar_dates rules)
+      description: |
+        Base set: `calendar` rows where date is in [start_date, end_date] and weekday flag matches.
+        Remove services with `calendar_dates.exception_type = 2` on that date.
+        Add services with `exception_type = 1` on that date (calendar-only feed pattern supported).
+        Optional `detail=true`: weekday pattern, route short names, trip counts. `include=window`: embed feed min/max dates.
+      parameters:
+        - in: query
+          name: date
+          description: YYYY-MM-DD (defaults to today, agency context is client-side)
+          schema: { type: string, format: date }
+        - in: query
+          name: detail
+          description: If true, include calendar row, display label, routes, trip counts per service
+          schema: { type: boolean, default: false }
+        - in: query
+          name: include
+          description: Comma-separated; use `window` to include `feed_calendar_window` on the payload
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarDayResponse" }
+        "400":
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/gtfs/calendar:
+    get:
+      tags: [Calendar]
+      summary: List GTFS calendar service definitions (weekly patterns)
+      parameters:
+        - in: query
+          name: page
+          schema: { type: integer, minimum: 1, default: 1 }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarListResponse" }
+
+  /v1/gtfs/calendar/{serviceId}:
+    get:
+      tags: [Calendar]
+      summary: Get one calendar service by service_id
+      parameters:
+        - in: path
+          name: serviceId
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarServiceResponse" }
+        "404":
+          description: Not found
+
   /v1/gtfs/calendar/service:
     get:
       tags: [Calendar]
@@ -348,21 +509,113 @@ paths:
     get:
       tags: [Calendar]
       summary: Calendar exceptions in a date range
+      description: Rows from `calendar_dates`. `exception_type` 1 = service added on that date, 2 = removed. Dates are YYYY-MM-DD in JSON.
       parameters:
         - in: query
           name: from
           required: true
-          schema: { type: string }
+          schema: { type: string, format: date }
         - in: query
           name: to
           required: true
-          schema: { type: string }
+          schema: { type: string, format: date }
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CalendarExceptionsResponse" }
+
+  /v1/map/routes-overlay:
+    get:
+      tags: [Map]
+      summary: Routes with polylines and stops per direction (map explorer)
+      description: |
+        Returns each requested route with `route_color` / `route_text_color` and `legs[]`.
+        Each leg is one GTFS direction: `points` (shape polyline) and `stops` (sequence along that pattern).
+        Polylines follow GTFS shapes (not road-snapped). For road-hugging lines, optionally snap client-side (e.g. Directions API).
+      parameters:
+        - in: query
+          name: routeIds
+          required: true
+          description: Comma-separated `route_id` values (max 25)
+          schema: { type: string, example: "M6,M61,M62" }
+        - in: query
+          name: directionId
+          description: If set (`0` or `1`), only that direction is included per route
+          schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: maxPoints
+          description: Vertex cap per shape (default 1800). Use 0 for full GTFS resolution (large JSON).
+          schema: { type: integer, minimum: 0, maximum: 25000 }
+        - in: query
+          name: routeIdsKind
+          description: |
+            Omit or `route_id` — each token is a GTFS `route_id`.
+            `short_name` — tokens are `route_short_name` (e.g. `4`, `M6`); backend resolves to `route_id`.
+          schema: { type: string, enum: [route_id, short_name, short] }
+      responses:
+        "200":
+          description: |
+            OK. `meta.missing_route_ids` lists tokens or route_ids with no drawable geometry.
+            `meta.requested_routes` is how many distinct routes were requested after resolution.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MapRoutesOverlayResponse" }
+        "400":
+          description: Missing or invalid routeIds
+
+  /v1/map/static:
+    get:
+      tags: [Map]
+      summary: Map bundle — nearby stops + route colors in one request
+      description: |
+        Prefer this for the live map instead of calling `/v1/gtfs/stops` and `/v1/gtfs/routes` separately.
+        Filter stops by `lat`, `lon`, and `radius`. If `routeIds` is set, only stops served by those routes
+        (via `stop_times` / `trips`) are returned, and `routes` lists only those lines — for “selected routes” map mode.
+        Route-filtered stops use the database (not only the snapshot).
+      parameters:
+        - in: query
+          name: lat
+          required: true
+          schema: { type: number, format: double }
+        - in: query
+          name: lon
+          required: true
+          schema: { type: number, format: double }
+        - in: query
+          name: radius
+          description: Search radius in meters (default from server config, max 50000)
+          schema: { type: integer, minimum: 1, maximum: 50000 }
+        - in: query
+          name: stopLimit
+          description: Max stops returned (nearest first), default 150, max 500
+          schema: { type: integer, minimum: 1, maximum: 500 }
+        - in: query
+          name: routeLimit
+          description: Max routes returned for badge colors, default 300, max 500
+          schema: { type: integer, minimum: 1, maximum: 500 }
+        - in: query
+          name: routeSearch
+          description: Optional filter on route short/long name (substring); applies to the route list
+          schema: { type: string }
+        - in: query
+          name: routeIds
+          description: |
+            Optional comma-separated `route_id` values (max 25). When set, limits stops and route list to these routes.
+          schema: { type: string, example: "R1,R2" }
+        - in: query
+          name: routeIdsKind
+          description: Use short_name when routeIds contains route numbers/names.
+          schema: { type: string, enum: [route_id, short_name, short] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MapStaticResponse" }
+        "400":
+          description: Missing or invalid lat/lon/radius
 
   /v1/map/vehicles:
     get:
@@ -376,6 +629,11 @@ paths:
               schema: { $ref: "#/components/schemas/VehiclesResponse" }
 
 components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
   schemas:
     APIStatus:
       type: object
@@ -389,13 +647,21 @@ components:
       properties:
         total: { type: integer }
         limit: { type: integer }
+        page: { type: integer }
+        has_next: { type: boolean }
         service_date: { type: string }
+        requested_routes: { type: integer }
+        missing_route_ids:
+          type: array
+          items: { type: string }
 
     StopSummary:
       type: object
       required: [stop_id, lat, lon]
       properties:
         stop_id: { type: string }
+        id: { type: string, description: duplicate of stop_id for map clients }
+        gtfs_stop_id: { type: string, description: duplicate of stop_id for alt parsers }
         stop_name: { type: string }
         stop_code: { type: string }
         lat: { type: number, format: double }
@@ -443,6 +709,9 @@ components:
       properties:
         route_id: { type: string }
         shape_id: { type: string }
+        total_points:
+          type: integer
+          description: Full vertex count for this shape_id in the database (before maxPoints sampling).
         points:
           type: array
           items: { $ref: "#/components/schemas/RouteShapePoint" }
@@ -517,14 +786,119 @@ components:
       type: object
       properties:
         service_id: { type: string }
-        date: { type: string }
-        exception_type: { type: string }
+        date: { type: string, format: date }
+        exception_type:
+          type: string
+          description: GTFS — 1 service added on date, 2 service removed on date
+          enum: ["1", "2"]
+
+    ServiceDisplay:
+      type: object
+      properties:
+        label: { type: string }
+        description: { type: string }
+        route_short_names:
+          type: array
+          items: { type: string }
+        trip_count: { type: integer }
+        has_trips: { type: boolean }
+
+    ActiveServiceOnDay:
+      type: object
+      required: [service_id, source]
+      properties:
+        service_id: { type: string }
+        source:
+          type: string
+          enum: [calendar, exception_added]
+        calendar: { $ref: "#/components/schemas/CalendarService" }
+        exceptions_today:
+          type: array
+          items: { $ref: "#/components/schemas/CalendarException" }
+        display: { $ref: "#/components/schemas/ServiceDisplay" }
+
+    CalendarDayPayload:
+      type: object
+      required: [date, services]
+      properties:
+        date: { type: string, format: date }
+        services:
+          type: array
+          items: { $ref: "#/components/schemas/ActiveServiceOnDay" }
+        calendar_date_events:
+          type: array
+          items: { $ref: "#/components/schemas/CalendarException" }
+        feed_calendar_window:
+          type: object
+          properties:
+            min_date: { type: string, format: date }
+            max_date: { type: string, format: date }
+
+    CalendarDayResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/CalendarDayPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    FeedCalendarWindow:
+      type: object
+      properties:
+        min_date: { type: string, format: date }
+        max_date: { type: string, format: date }
+
+    FeedActivePayload:
+      type: object
+      properties:
+        calendar_window: { $ref: "#/components/schemas/FeedCalendarWindow" }
+        last_successful_sync: { type: string, format: date-time, nullable: true }
+
+    FeedActiveResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/FeedActivePayload" }
+
+    APIError:
+      type: object
+      required: [code, message, request_id]
+      properties:
+        code: { type: string }
+        message: { type: string }
+        request_id: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error: { $ref: "#/components/schemas/APIError" }
 
     ErrorResponse:
       type: object
       required: [error]
       properties:
         error: { type: string }
+
+    FavoriteRoute:
+      type: object
+      required: [route_id]
+      properties:
+        route_id: { type: string }
+
+    FavoriteRouteRequest:
+      type: object
+      required: [route_id]
+      properties:
+        route_id: { type: string }
+
+    FavoriteRoutesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/FavoriteRoute" }
+        meta: { $ref: "#/components/schemas/Meta" }
 
     AuthRequest:
       type: object
@@ -637,6 +1011,36 @@ components:
           items: { $ref: "#/components/schemas/TripStopTime" }
         meta: { $ref: "#/components/schemas/Meta" }
 
+    CalendarService:
+      type: object
+      required: [service_id, start_date, end_date]
+      properties:
+        service_id: { type: string }
+        monday: { type: string, description: "0 or 1" }
+        tuesday: { type: string }
+        wednesday: { type: string }
+        thursday: { type: string }
+        friday: { type: string }
+        saturday: { type: string }
+        sunday: { type: string }
+        start_date: { type: string, format: date }
+        end_date: { type: string, format: date }
+
+    CalendarListResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { $ref: "#/components/schemas/CalendarService" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    CalendarServiceResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/CalendarService" }
+
     ServiceCalendarResponse:
       type: object
       properties:
@@ -653,6 +1057,85 @@ components:
         data:
           type: array
           items: { $ref: "#/components/schemas/CalendarException" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    RouteMapLite:
+      type: object
+      required: [route_id]
+      properties:
+        route_id: { type: string }
+        short_name: { type: string }
+        long_name: { type: string }
+        route_color: { type: string }
+        route_text_color: { type: string }
+
+    MapStaticBundle:
+      type: object
+      required: [stops, routes]
+      properties:
+        stops:
+          type: array
+          items: { $ref: "#/components/schemas/StopSummary" }
+        routes:
+          type: array
+          items: { $ref: "#/components/schemas/RouteMapLite" }
+
+    MapStaticResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/MapStaticBundle" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    MapRouteLeg:
+      type: object
+      required: [direction_id]
+      properties:
+        direction_id: { type: string }
+        headsign: { type: string }
+        shape_id: { type: string }
+        points:
+          type: array
+          items: { $ref: "#/components/schemas/RouteShapePoint" }
+        total_points: { type: integer }
+        stops:
+          type: array
+          items: { $ref: "#/components/schemas/StopSummary" }
+
+    MapRouteWithGeometry:
+      type: object
+      required: [route_id, legs]
+      properties:
+        route_id: { type: string }
+        short_name: { type: string }
+        long_name: { type: string }
+        route_color: { type: string }
+        route_text_color: { type: string }
+        legs:
+          type: array
+          items: { $ref: "#/components/schemas/MapRouteLeg" }
+        all_stops:
+          type: array
+          description: Deduped union of all leg.stops (route-level pins)
+          items: { $ref: "#/components/schemas/StopSummary" }
+        stops:
+          type: array
+          description: Same as all_stops (for parsers that read route.stops)
+          items: { $ref: "#/components/schemas/StopSummary" }
+
+    MapRoutesOverlayPayload:
+      type: object
+      required: [routes]
+      properties:
+        routes:
+          type: array
+          items: { $ref: "#/components/schemas/MapRouteWithGeometry" }
+
+    MapRoutesOverlayResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/MapRoutesOverlayPayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     VehiclesResponse:

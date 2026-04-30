@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"time"
@@ -51,6 +52,7 @@ type StopSearchParams struct {
 	RadiusMeters int
 	Limit        int
 	Page         int
+	RouteIDs     []string // optional: only stops that appear on these routes (via stop_times/trips)
 }
 
 func (r *Repository) SearchStops(ctx context.Context, p StopSearchParams) ([]models.StopSummary, int, error) {
@@ -80,6 +82,18 @@ func (r *Repository) SearchStops(ctx context.Context, p StopSearchParams) ([]mod
 				lonIdx, latIdx, len(args),
 			))
 		}
+	}
+
+	if len(p.RouteIDs) > 0 {
+		args = append(args, p.RouteIDs)
+		filters = append(filters, fmt.Sprintf(
+			`EXISTS (
+				SELECT 1 FROM stop_times st
+				JOIN trips t ON t.trip_id = st.trip_id
+				WHERE st.stop_id = stops.stop_id AND t.route_id = ANY($%d::text[])
+			)`,
+			len(args),
+		))
 	}
 
 	where := ""
@@ -246,8 +260,11 @@ active_services AS (
 	  ON ex.date = to_char(cd.d, 'YYYYMMDD')
 	 AND ex.exception_type = '1'
 ),
+active_services_dedup AS (
+	SELECT DISTINCT service_date, service_id FROM active_services
+),
 candidates AS (
-	SELECT
+	SELECT DISTINCT ON (st.trip_id, a.service_date)
 		st.trip_id,
 		t.route_id,
 		t.trip_headsign,
@@ -255,8 +272,9 @@ candidates AS (
 		(a.service_date::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time
 	FROM stop_times st
 	JOIN trips t ON t.trip_id = st.trip_id
-	JOIN active_services a ON a.service_id = t.service_id
+	JOIN active_services_dedup a ON a.service_id = t.service_id
 	WHERE st.stop_id = $2
+	ORDER BY st.trip_id, a.service_date
 )
 SELECT
 	c.trip_id,
@@ -271,8 +289,12 @@ SELECT
 	(rt.trip_id IS NOT NULL) AS is_realtime
 FROM candidates c
 LEFT JOIN routes r ON r.route_id = c.route_id
-LEFT JOIN trip_update_stop_times_current rt
-	ON rt.trip_id = c.trip_id AND rt.stop_id = $2
+LEFT JOIN LATERAL (
+	SELECT rt_inner.trip_id, rt_inner.arrival_delay
+	FROM trip_update_stop_times_current rt_inner
+	WHERE rt_inner.trip_id = c.trip_id AND rt_inner.stop_id = $2
+	LIMIT 1
+) rt ON true
 WHERE c.scheduled_time >= (SELECT at FROM at_ts)
   AND c.scheduled_time <= (SELECT at FROM at_ts) + ($3::int || ' minutes')::interval
 ORDER BY c.scheduled_time
@@ -393,23 +415,95 @@ WHERE route_id = $1
 	return &rt, nil
 }
 
+// LookupRouteIDByShortName returns route_id for an exact GTFS route_short_name (trimmed).
+// ErrNoRows if none; error if more than one row matches (ambiguous).
+func (r *Repository) LookupRouteIDByShortName(ctx context.Context, shortName string) (string, error) {
+	const q = `
+SELECT route_id
+FROM routes
+WHERE TRIM(COALESCE(route_short_name, '')) = $1
+LIMIT 2
+`
+	rows, err := r.pool.Query(ctx, q, shortName)
+	if err != nil {
+		return "", fmt.Errorf("lookup route by short name: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return "", err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	switch len(ids) {
+	case 0:
+		return "", pgx.ErrNoRows
+	case 1:
+		return ids[0], nil
+	default:
+		return "", fmt.Errorf("ambiguous route_short_name %q", shortName)
+	}
+}
+
 func (r *Repository) GetRouteStops(ctx context.Context, routeID, directionID string) ([]models.StopSummary, error) {
-	base := `
+	// When direction is specified, prefer a representative trip pattern so the
+	// stops list aligns with the route shape shown on the map.
+	if directionID != "" {
+		const q = `
+WITH representative_trip AS (
+	SELECT t.trip_id
+	FROM trips t
+	JOIN stop_times st ON st.trip_id = t.trip_id
+	WHERE t.route_id = $1
+	  AND COALESCE(t.direction_id, '') = $2
+	GROUP BY t.trip_id
+	ORDER BY COUNT(*) DESC, t.trip_id
+	LIMIT 1
+)
+SELECT s.stop_id, COALESCE(s.stop_name,''), COALESCE(s.stop_code,''), COALESCE(s.stop_lat,0), COALESCE(s.stop_lon,0)
+FROM stop_times st
+JOIN representative_trip rt ON rt.trip_id = st.trip_id
+JOIN stops s ON s.stop_id = st.stop_id
+ORDER BY st.stop_sequence
+`
+		rows, err := r.pool.Query(ctx, q, routeID, directionID)
+		if err != nil {
+			return nil, fmt.Errorf("query route stops by representative trip: %w", err)
+		}
+		defer rows.Close()
+
+		out := make([]models.StopSummary, 0, 64)
+		for rows.Next() {
+			var s models.StopSummary
+			if err = rows.Scan(&s.StopID, &s.StopName, &s.StopCode, &s.Lat, &s.Lon); err != nil {
+				return nil, fmt.Errorf("scan route stop: %w", err)
+			}
+			out = append(out, s)
+		}
+		if err = rows.Err(); err != nil {
+			return nil, err
+		}
+		if len(out) == 0 {
+			return nil, pgx.ErrNoRows
+		}
+		return out, nil
+	}
+
+	const q = `
 SELECT DISTINCT s.stop_id, COALESCE(s.stop_name,''), COALESCE(s.stop_code,''), COALESCE(s.stop_lat,0), COALESCE(s.stop_lon,0)
 FROM stops s
 JOIN stop_times st ON st.stop_id = s.stop_id
 JOIN trips t ON t.trip_id = st.trip_id
 WHERE t.route_id = $1
-`
-	args := []any{routeID}
-	if directionID != "" {
-		base += " AND COALESCE(t.direction_id, '') = $2\n"
-		args = append(args, directionID)
-	}
-	base += `
 ORDER BY 2 NULLS LAST
 `
-	rows, err := r.pool.Query(ctx, base, args...)
+	rows, err := r.pool.Query(ctx, q, routeID)
 	if err != nil {
 		return nil, fmt.Errorf("query route stops: %w", err)
 	}
@@ -426,50 +520,118 @@ ORDER BY 2 NULLS LAST
 	return out, rows.Err()
 }
 
-func (r *Repository) GetRouteShape(ctx context.Context, routeID, directionID string) (*models.RouteShape, error) {
-	q := `
-WITH selected_shape AS (
-	SELECT shape_id
-	FROM trips
-	WHERE route_id = $1
-	  AND shape_id IS NOT NULL
-	  AND shape_id <> ''
-`
-	args := []any{routeID}
-	if directionID != "" {
-		q += " AND COALESCE(direction_id, '') = $2\n"
-		args = append(args, directionID)
-	}
-	q += `
-	GROUP BY shape_id
-	ORDER BY COUNT(*) DESC
+// GetRouteStopsAlongShapeTrip returns stops for the same representative trip used
+// by GetRouteShape (must have a non-empty shape_id). Use this for map overlays so
+// pins align with the drawn polyline.
+func (r *Repository) GetRouteStopsAlongShapeTrip(ctx context.Context, routeID, directionID string) ([]models.StopSummary, error) {
+	const q = `
+WITH representative_trip AS (
+	SELECT t.trip_id
+	FROM trips t
+	JOIN stop_times st ON st.trip_id = t.trip_id
+	WHERE t.route_id = $1
+	  AND t.shape_id IS NOT NULL
+	  AND t.shape_id <> ''
+	  AND ($2 = '' OR COALESCE(t.direction_id, '') = $2)
+	GROUP BY t.trip_id, t.shape_id
+	ORDER BY COUNT(*) DESC, t.trip_id
 	LIMIT 1
 )
-SELECT s.shape_id, s.shape_pt_sequence, s.shape_pt_lat, s.shape_pt_lon
-FROM shapes s
-JOIN selected_shape ss ON ss.shape_id = s.shape_id
-WHERE s.shape_pt_lat IS NOT NULL AND s.shape_pt_lon IS NOT NULL
-ORDER BY s.shape_pt_sequence
+SELECT s.stop_id, COALESCE(s.stop_name,''), COALESCE(s.stop_code,''), COALESCE(s.stop_lat,0), COALESCE(s.stop_lon,0)
+FROM stop_times st
+JOIN representative_trip rt ON rt.trip_id = st.trip_id
+JOIN stops s ON s.stop_id = st.stop_id
+WHERE s.stop_lat IS NOT NULL AND s.stop_lon IS NOT NULL
+ORDER BY st.stop_sequence
 `
-	rows, err := r.pool.Query(ctx, q, args...)
+	rows, err := r.pool.Query(ctx, q, routeID, directionID)
+	if err != nil {
+		return nil, fmt.Errorf("query route stops along shape trip: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.StopSummary, 0, 64)
+	for rows.Next() {
+		var s models.StopSummary
+		if err = rows.Scan(&s.StopID, &s.StopName, &s.StopCode, &s.Lat, &s.Lon); err != nil {
+			return nil, fmt.Errorf("scan route stop: %w", err)
+		}
+		out = append(out, s)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetRouteShape returns one representative polyline for the route. maxPoints
+// caps how many vertices are returned (uniform sampling in SQL). Use 0 for no
+// cap (full GTFS resolution — can be slow and very large JSON).
+func (r *Repository) GetRouteShape(ctx context.Context, routeID, directionID string, maxPoints int) (*models.RouteShape, error) {
+	const q = `
+WITH representative_trip AS (
+	SELECT t.trip_id, t.shape_id
+	FROM trips t
+	JOIN stop_times st ON st.trip_id = t.trip_id
+	WHERE t.route_id = $1
+	  AND t.shape_id IS NOT NULL
+	  AND t.shape_id <> ''
+	  AND ($2 = '' OR COALESCE(t.direction_id, '') = $2)
+	GROUP BY t.trip_id, t.shape_id
+	ORDER BY COUNT(*) DESC, t.trip_id
+	LIMIT 1
+),
+scoped AS (
+	SELECT
+		s.shape_id,
+		s.shape_pt_sequence,
+		s.shape_pt_lat,
+		s.shape_pt_lon,
+		ROW_NUMBER() OVER (ORDER BY s.shape_pt_sequence) AS rn,
+		COUNT(*) OVER ()::int AS tot
+	FROM shapes s
+	JOIN representative_trip rt ON rt.shape_id = s.shape_id
+	WHERE s.shape_pt_lat IS NOT NULL AND s.shape_pt_lon IS NOT NULL
+)
+SELECT shape_id, shape_pt_sequence, shape_pt_lat, shape_pt_lon, tot
+FROM scoped
+WHERE $3::int <= 0
+   OR tot <= $3::int
+   OR rn = 1
+   OR rn = tot
+   OR ($3::int = 1 AND rn = 1)
+   OR (
+        $3::int >= 2 AND tot > $3::int
+        AND (rn - 1) % GREATEST(1, ((tot - 1) + ($3::int - 2)) / NULLIF($3::int - 1, 0)) = 0
+      )
+ORDER BY shape_pt_sequence
+`
+	dir := directionID
+	rows, err := r.pool.Query(ctx, q, routeID, dir, maxPoints)
 	if err != nil {
 		return nil, fmt.Errorf("query route shape: %w", err)
 	}
 	defer rows.Close()
 
+	preCap := maxPoints
+	if preCap <= 0 {
+		preCap = 1024
+	}
 	shape := &models.RouteShape{
 		RouteID: routeID,
-		Points:  make([]models.RouteShapePoint, 0, 128),
+		Points:  make([]models.RouteShapePoint, 0, preCap),
 	}
 	for rows.Next() {
 		var (
 			shapeID string
 			pt      models.RouteShapePoint
+			tot     int
 		)
-		if err = rows.Scan(&shapeID, &pt.Sequence, &pt.Lat, &pt.Lon); err != nil {
+		if err = rows.Scan(&shapeID, &pt.Sequence, &pt.Lat, &pt.Lon, &tot); err != nil {
 			return nil, fmt.Errorf("scan route shape point: %w", err)
 		}
 		shape.ShapeID = shapeID
+		shape.TotalPoints = tot
 		shape.Points = append(shape.Points, pt)
 	}
 	if err = rows.Err(); err != nil {
@@ -507,6 +669,109 @@ ORDER BY COALESCE(direction_id, '')
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// overlayDirectionKeep returns false if this direction row should be skipped when
+// the client asked for a single direction. Feeds often leave direction_id blank for
+// all trips; those rows must still match directionId=0 or 1 on the client.
+func overlayDirectionKeep(onlyDirection, rowDirectionID string) bool {
+	if onlyDirection == "" {
+		return true
+	}
+	if rowDirectionID == onlyDirection {
+		return true
+	}
+	// Unlabeled direction in GTFS: still show when user picked one direction
+	// (there is no separate inbound/outbound in the data).
+	if rowDirectionID == "" {
+		return true
+	}
+	return false
+}
+
+// GetMapRouteWithGeometry loads route display fields, then for each GTFS direction
+// loads the representative shape (capped) and matching stop sequence.
+func (r *Repository) GetMapRouteWithGeometry(ctx context.Context, routeID string, maxShapePoints int, onlyDirection string) (*models.MapRouteWithGeometry, error) {
+	rt, err := r.GetRoute(ctx, routeID)
+	if err != nil {
+		return nil, err
+	}
+	dirs, err := r.GetRouteDirections(ctx, routeID)
+	if err != nil {
+		return nil, err
+	}
+
+	out := &models.MapRouteWithGeometry{
+		RouteID:        rt.RouteID,
+		ShortName:      rt.ShortName,
+		LongName:       rt.LongName,
+		RouteColor:     rt.RouteColor,
+		RouteTextColor: rt.RouteTextColor,
+		Legs:           make([]models.MapRouteLeg, 0, len(dirs)),
+	}
+
+	for _, d := range dirs {
+		if !overlayDirectionKeep(onlyDirection, d.DirectionID) {
+			continue
+		}
+		dirID := d.DirectionID
+		leg := models.MapRouteLeg{
+			DirectionID: d.DirectionID,
+			Headsign:    d.Headsign,
+			Points:      []models.RouteShapePoint{},
+			Stops:       []models.StopSummary{},
+		}
+
+		shape, errSh := r.GetRouteShape(ctx, routeID, dirID, maxShapePoints)
+		if errSh == nil && shape != nil {
+			leg.ShapeID = shape.ShapeID
+			leg.Points = shape.Points
+			leg.TotalPoints = shape.TotalPoints
+		}
+
+		// Stops must come from the same shape-backed trip as the polyline when possible.
+		stops, errSt := r.GetRouteStopsAlongShapeTrip(ctx, routeID, dirID)
+		if errSt != nil || len(stops) == 0 {
+			stops, errSt = r.GetRouteStops(ctx, routeID, dirID)
+		}
+		if errSt != nil || len(stops) == 0 {
+			stops, _ = r.GetRouteStops(ctx, routeID, "")
+		}
+		if stops != nil {
+			leg.Stops = stops
+		}
+
+		if len(leg.Points) == 0 && len(leg.Stops) == 0 {
+			continue
+		}
+		models.EnrichStopSummariesForMap(leg.Stops)
+		out.Legs = append(out.Legs, leg)
+	}
+
+	if len(out.Legs) == 0 {
+		return nil, pgx.ErrNoRows
+	}
+
+	seen := make(map[string]struct{}, 128)
+	union := make([]models.StopSummary, 0, 128)
+	for i := range out.Legs {
+		for _, s := range out.Legs[i].Stops {
+			if s.StopID == "" {
+				continue
+			}
+			if _, ok := seen[s.StopID]; ok {
+				continue
+			}
+			seen[s.StopID] = struct{}{}
+			union = append(union, s)
+		}
+	}
+	if len(union) > 0 {
+		out.AllStops = union
+		out.Stops = union
+	}
+
+	return out, nil
 }
 
 // ============================================================================
@@ -637,32 +902,92 @@ JOIN active_services a ON a.service_id = t.service_id
 // Calendar
 // ============================================================================
 
+func (r *Repository) ListCalendarServices(ctx context.Context, page, limit int) ([]models.CalendarService, int, error) {
+	offset := (page - 1) * limit
+	var total int
+	if err := r.pool.QueryRow(ctx, `SELECT COUNT(*) FROM calendar`).Scan(&total); err != nil {
+		return nil, 0, fmt.Errorf("count calendar: %w", err)
+	}
+	const q = `
+SELECT service_id,
+	COALESCE(monday::text,'0'), COALESCE(tuesday::text,'0'), COALESCE(wednesday::text,'0'),
+	COALESCE(thursday::text,'0'), COALESCE(friday::text,'0'), COALESCE(saturday::text,'0'), COALESCE(sunday::text,'0'),
+	to_char(to_date(start_date, 'YYYYMMDD'), 'YYYY-MM-DD'),
+	to_char(to_date(end_date, 'YYYYMMDD'), 'YYYY-MM-DD')
+FROM calendar
+ORDER BY service_id
+LIMIT $1 OFFSET $2
+`
+	rows, err := r.pool.Query(ctx, q, limit, offset)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query calendar list: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.CalendarService, 0, limit)
+	for rows.Next() {
+		var c models.CalendarService
+		if err = rows.Scan(
+			&c.ServiceID, &c.Monday, &c.Tuesday, &c.Wednesday, &c.Thursday, &c.Friday, &c.Saturday, &c.Sunday,
+			&c.StartDate, &c.EndDate,
+		); err != nil {
+			return nil, 0, fmt.Errorf("scan calendar: %w", err)
+		}
+		out = append(out, c)
+	}
+	return out, total, rows.Err()
+}
+
+func (r *Repository) GetCalendarService(ctx context.Context, serviceID string) (*models.CalendarService, error) {
+	const q = `
+SELECT service_id,
+	COALESCE(monday::text,'0'), COALESCE(tuesday::text,'0'), COALESCE(wednesday::text,'0'),
+	COALESCE(thursday::text,'0'), COALESCE(friday::text,'0'), COALESCE(saturday::text,'0'), COALESCE(sunday::text,'0'),
+	to_char(to_date(start_date, 'YYYYMMDD'), 'YYYY-MM-DD'),
+	to_char(to_date(end_date, 'YYYYMMDD'), 'YYYY-MM-DD')
+FROM calendar
+WHERE service_id = $1
+`
+	var c models.CalendarService
+	err := r.pool.QueryRow(ctx, q, serviceID).Scan(
+		&c.ServiceID, &c.Monday, &c.Tuesday, &c.Wednesday, &c.Thursday, &c.Friday, &c.Saturday, &c.Sunday,
+		&c.StartDate, &c.EndDate,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
 func (r *Repository) GetServiceCalendarOnDate(ctx context.Context, date string) ([]models.ServiceCalendarDay, error) {
+	// Weekday flags as text (int/bool/smallint). Exception 1 = service runs; 2 = removed for that date.
 	const q = `
 SELECT c.service_id, 'calendar' AS source
 FROM calendar c
 WHERE to_date(c.start_date, 'YYYYMMDD') <= $1::date
   AND to_date(c.end_date,   'YYYYMMDD') >= $1::date
-  AND CASE EXTRACT(ISODOW FROM $1::date)
-		WHEN 1 THEN c.monday
-		WHEN 2 THEN c.tuesday
-		WHEN 3 THEN c.wednesday
-		WHEN 4 THEN c.thursday
-		WHEN 5 THEN c.friday
-		WHEN 6 THEN c.saturday
-		WHEN 7 THEN c.sunday
-	 END = '1'
+  AND lower(trim(both from (
+	CASE EXTRACT(ISODOW FROM $1::date)::int
+		WHEN 1 THEN COALESCE(c.monday::text, '0')
+		WHEN 2 THEN COALESCE(c.tuesday::text, '0')
+		WHEN 3 THEN COALESCE(c.wednesday::text, '0')
+		WHEN 4 THEN COALESCE(c.thursday::text, '0')
+		WHEN 5 THEN COALESCE(c.friday::text, '0')
+		WHEN 6 THEN COALESCE(c.saturday::text, '0')
+		WHEN 7 THEN COALESCE(c.sunday::text, '0')
+	END
+  ))) IN ('1', 't', 'true')
   AND NOT EXISTS (
 	SELECT 1 FROM calendar_dates ex
 	WHERE ex.service_id = c.service_id
 	  AND ex.date = to_char($1::date, 'YYYYMMDD')
-	  AND ex.exception_type = '2'
+	  AND trim(both from COALESCE(ex.exception_type::text, '')) IN ('2')
   )
 UNION
 SELECT ex.service_id, 'exception_added' AS source
 FROM calendar_dates ex
 WHERE ex.date = to_char($1::date, 'YYYYMMDD')
-  AND ex.exception_type = '1'
+  AND trim(both from COALESCE(ex.exception_type::text, '')) IN ('1')
 ORDER BY service_id
 `
 	rows, err := r.pool.Query(ctx, q, date)
@@ -684,11 +1009,13 @@ ORDER BY service_id
 
 func (r *Repository) GetCalendarExceptions(ctx context.Context, fromDate, toDate string) ([]models.CalendarException, error) {
 	const q = `
-SELECT service_id, date, COALESCE(exception_type,'')
+SELECT service_id,
+	to_char(to_date(date, 'YYYYMMDD'), 'YYYY-MM-DD'),
+	trim(both from COALESCE(exception_type::text, ''))
 FROM calendar_dates
-WHERE date >= to_char($1::date, 'YYYYMMDD')
-  AND date <= to_char($2::date, 'YYYYMMDD')
-ORDER BY date, service_id
+WHERE to_date(date, 'YYYYMMDD') >= $1::date
+  AND to_date(date, 'YYYYMMDD') <= $2::date
+ORDER BY to_date(date, 'YYYYMMDD'), service_id
 `
 	rows, err := r.pool.Query(ctx, q, fromDate, toDate)
 	if err != nil {
@@ -705,6 +1032,117 @@ ORDER BY date, service_id
 		out = append(out, e)
 	}
 	return out, rows.Err()
+}
+
+// GetFeedCalendarWindow returns min/max calendar coverage from calendar + calendar_dates tables.
+func (r *Repository) GetFeedCalendarWindow(ctx context.Context) (*models.FeedCalendarWindow, error) {
+	const q = `
+SELECT
+	to_char(MIN(x.d), 'YYYY-MM-DD'),
+	to_char(MAX(x.d), 'YYYY-MM-DD')
+FROM (
+	SELECT to_date(start_date, 'YYYYMMDD') AS d FROM calendar WHERE start_date ~ '^[0-9]{8}$'
+	UNION ALL
+	SELECT to_date(end_date, 'YYYYMMDD') FROM calendar WHERE end_date ~ '^[0-9]{8}$'
+	UNION ALL
+	SELECT to_date(date, 'YYYYMMDD') FROM calendar_dates WHERE date ~ '^[0-9]{8}$'
+) x
+WHERE x.d IS NOT NULL
+`
+	var minD, maxD sql.NullString
+	if err := r.pool.QueryRow(ctx, q).Scan(&minD, &maxD); err != nil {
+		return nil, fmt.Errorf("feed calendar window: %w", err)
+	}
+	if !minD.Valid || !maxD.Valid || minD.String == "" || maxD.String == "" {
+		return &models.FeedCalendarWindow{}, nil
+	}
+	return &models.FeedCalendarWindow{MinDate: minD.String, MaxDate: maxD.String}, nil
+}
+
+// CountTripsForService returns how many trips reference service_id (static timetable).
+func (r *Repository) CountTripsForService(ctx context.Context, serviceID string) (int, error) {
+	const q = `SELECT COUNT(*)::int FROM trips WHERE service_id = $1`
+	var n int
+	if err := r.pool.QueryRow(ctx, q, serviceID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("count trips for service: %w", err)
+	}
+	return n, nil
+}
+
+// RouteShortNamesForService returns distinct route short names (or route_id fallback) for trips on service_id.
+func (r *Repository) RouteShortNamesForService(ctx context.Context, serviceID string) ([]string, error) {
+	const q = `
+SELECT DISTINCT COALESCE(NULLIF(trim(both from r.route_short_name), ''), t.route_id)
+FROM trips t
+JOIN routes r ON r.route_id = t.route_id
+WHERE t.service_id = $1
+ORDER BY 1
+LIMIT 48
+`
+	rows, err := r.pool.Query(ctx, q, serviceID)
+	if err != nil {
+		return nil, fmt.Errorf("route names for service: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]string, 0, 16)
+	for rows.Next() {
+		var s string
+		if err = rows.Scan(&s); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
+}
+
+// ListFavoriteRoutes returns all route ids favorited by user_id.
+func (r *Repository) ListFavoriteRoutes(ctx context.Context, userID string) ([]models.FavoriteRoute, error) {
+	const q = `
+SELECT route_id
+FROM user_favorite_routes
+WHERE user_id = $1::uuid
+ORDER BY created_at DESC, route_id
+`
+	rows, err := r.pool.Query(ctx, q, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list favorite routes: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.FavoriteRoute, 0, 16)
+	for rows.Next() {
+		var f models.FavoriteRoute
+		if err = rows.Scan(&f.RouteID); err != nil {
+			return nil, fmt.Errorf("scan favorite route: %w", err)
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// AddFavoriteRoute inserts one (user_id, route_id) pair, ignoring duplicates.
+func (r *Repository) AddFavoriteRoute(ctx context.Context, userID, routeID string) error {
+	const q = `
+INSERT INTO user_favorite_routes (user_id, route_id)
+VALUES ($1::uuid, $2)
+ON CONFLICT (user_id, route_id) DO NOTHING
+`
+	if _, err := r.pool.Exec(ctx, q, userID, routeID); err != nil {
+		return fmt.Errorf("add favorite route: %w", err)
+	}
+	return nil
+}
+
+func (r *Repository) DeleteFavoriteRoute(ctx context.Context, userID, routeID string) error {
+	const q = `
+DELETE FROM user_favorite_routes
+WHERE user_id = $1::uuid AND route_id = $2
+`
+	if _, err := r.pool.Exec(ctx, q, userID, routeID); err != nil {
+		return fmt.Errorf("delete favorite route: %w", err)
+	}
+	return nil
 }
 
 // ============================================================================

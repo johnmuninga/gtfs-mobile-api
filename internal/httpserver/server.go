@@ -2,10 +2,14 @@ package httpserver
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -31,7 +35,19 @@ const (
 	maxDepartures      = 50
 	defaultWindowMins  = 60
 	maxWindowMins      = 360
-	requestTimeout     = 5 * time.Second
+	defaultShapePoints = 2000 // cap returned vertices; full table may be 400k+ rows across all shapes
+	minShapePoints     = 50
+	maxShapePoints     = 25000
+	defaultMapStops    = 150
+	maxMapStops        = 500
+	defaultMapRoutes   = 300
+	maxMapRoutes       = 500
+	defaultOverlayShapePoints = 1800
+	maxOverlayRoutes          = 25
+	defaultCalendarLimit      = 100
+	maxCalendarLimit          = 500
+	requestTimeout            = 5 * time.Second
+	mapOverlayTimeout         = 25 * time.Second
 )
 
 type Server struct {
@@ -55,6 +71,7 @@ func New(cfg config.Config, repo *repository.Repository, snap *snapshot.Snapshot
 func (s *Server) Router() http.Handler {
 	mux := http.NewServeMux()
 
+	mux.HandleFunc("GET /", s.handleSwaggerRoot)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	mux.HandleFunc("GET /swagger", s.handleSwaggerUI)
 	mux.HandleFunc("GET /swagger/", s.handleSwaggerUI)
@@ -62,6 +79,9 @@ func (s *Server) Router() http.Handler {
 	mux.HandleFunc("POST /v1/auth/signup", s.handleAuthSignup)
 	mux.HandleFunc("POST /v1/auth/login", s.handleAuthLogin)
 	mux.HandleFunc("POST /v1/auth/verify-otp", s.handleAuthVerifyOTP)
+	mux.HandleFunc("GET /v1/users/me/favorite-routes", s.handleListFavoriteRoutes)
+	mux.HandleFunc("POST /v1/users/me/favorite-routes", s.handleAddFavoriteRoute)
+	mux.HandleFunc("DELETE /v1/users/me/favorite-routes/{routeId}", s.handleDeleteFavoriteRoute)
 
 	// Static GTFS endpoints (cacheable)
 	staticCache := cacheControl(60)
@@ -83,11 +103,337 @@ func (s *Server) Router() http.Handler {
 
 	mux.Handle("GET /v1/gtfs/calendar/service", staticCache(http.HandlerFunc(s.handleServiceCalendar)))
 	mux.Handle("GET /v1/gtfs/calendar/exceptions", staticCache(http.HandlerFunc(s.handleCalendarExceptions)))
+	mux.Handle("GET /v1/gtfs/calendar/day", staticCache(http.HandlerFunc(s.handleCalendarDay)))
+	mux.Handle("GET /v1/gtfs/calendar/{serviceId}", staticCache(http.HandlerFunc(s.handleGetCalendarService)))
+	mux.Handle("GET /v1/gtfs/calendar", staticCache(http.HandlerFunc(s.handleListCalendar)))
+
+	mux.HandleFunc("GET /v1/feed/active", s.handleFeedActive)
+
+	// Map: one lightweight call for pins + route colors (snapshot; no double fetch)
+	mux.Handle("GET /v1/map/static", staticCache(http.HandlerFunc(s.handleMapStatic)))
+	// Map: colored polylines + stops per route/direction (for “map explorer” overlays)
+	mux.Handle("GET /v1/map/routes-overlay", staticCache(http.HandlerFunc(s.handleMapRoutesOverlay)))
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
 
 	return recoverMiddleware(gzipMiddleware(mux))
+}
+
+func routeMapLite(r models.Route) models.RouteMapLite {
+	return models.RouteMapLite{
+		RouteID:        r.RouteID,
+		ShortName:      r.ShortName,
+		LongName:       r.LongName,
+		RouteColor:     r.RouteColor,
+		RouteTextColor: r.RouteTextColor,
+	}
+}
+
+// parseRouteIDsFromQuery reads routeIds (comma-separated or repeated) and optional routeIdsKind.
+// Same resolution rules as /v1/map/routes-overlay; capped at maxOverlayRoutes.
+func (s *Server) parseRouteIDsFromQuery(ctx context.Context, q url.Values) []string {
+	raw := strings.TrimSpace(q.Get("routeIds"))
+	multi := q["routeIds"]
+	var parts []string
+	if len(multi) > 1 {
+		parts = multi
+	} else if raw != "" {
+		parts = strings.Split(raw, ",")
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	kind := strings.ToLower(strings.TrimSpace(q.Get("routeIdsKind")))
+	byShort := kind == "short_name" || kind == "short"
+	seen := make(map[string]struct{}, len(parts))
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		token := strings.TrimSpace(p)
+		if token == "" {
+			continue
+		}
+		id := token
+		if byShort {
+			rid, err := s.repo.LookupRouteIDByShortName(ctx, token)
+			if err != nil {
+				continue
+			}
+			id = rid
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+		if len(out) >= maxOverlayRoutes {
+			break
+		}
+	}
+	return out
+}
+
+// mapStaticRoutesLiteOrdered returns colors/names only for the given route ids (map filter mode).
+func (s *Server) mapStaticRoutesLiteOrdered(ctx context.Context, filterIDs []string, routeSearch string) []models.RouteMapLite {
+	q := strings.ToLower(strings.TrimSpace(routeSearch))
+	out := make([]models.RouteMapLite, 0, len(filterIDs))
+	if s.snapshot != nil && s.snapshot.Loaded() {
+		for _, id := range filterIDs {
+			rt, ok := s.snapshot.RouteByID(id)
+			if !ok {
+				continue
+			}
+			if q != "" {
+				if !strings.Contains(strings.ToLower(rt.ShortName), q) &&
+					!strings.Contains(strings.ToLower(rt.LongName), q) {
+					continue
+				}
+			}
+			out = append(out, routeMapLite(rt))
+		}
+		return out
+	}
+	for _, id := range filterIDs {
+		rt, err := s.repo.GetRoute(ctx, id)
+		if err != nil {
+			continue
+		}
+		if q != "" {
+			if !strings.Contains(strings.ToLower(rt.ShortName), q) &&
+				!strings.Contains(strings.ToLower(rt.LongName), q) {
+				continue
+			}
+		}
+		out = append(out, routeMapLite(*rt))
+	}
+	return out
+}
+
+// handleMapStatic returns stops near a point plus a slim route list in one JSON payload.
+// The app should call this on region change (debounced) instead of separate /stops + /routes.
+func (s *Server) handleMapStatic(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	hasLat, latErr := optionalFloat(q, "lat")
+	hasLon, lonErr := optionalFloat(q, "lon")
+	if latErr != nil || lonErr != nil {
+		httpError(w, http.StatusBadRequest, "invalid lat or lon")
+		return
+	}
+	if hasLat == nil || hasLon == nil {
+		httpError(w, http.StatusBadRequest, "lat and lon are required")
+		return
+	}
+	lat, lon := *hasLat, *hasLon
+
+	radius := s.cfg.NearbyDefaultRadiusMeters
+	if raw := q.Get("radius"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 || v > 50_000 {
+			httpError(w, http.StatusBadRequest, "invalid radius (1–50000 meters)")
+			return
+		}
+		radius = v
+	}
+
+	stopLimit := clamp(parseIntOr(q.Get("stopLimit"), defaultMapStops), 1, maxMapStops)
+	routeLimit := clamp(parseIntOr(q.Get("routeLimit"), defaultMapRoutes), 1, maxMapRoutes)
+	routeSearch := strings.TrimSpace(q.Get("routeSearch"))
+	filterRouteIDs := s.parseRouteIDsFromQuery(ctx, q)
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	var (
+		stops      []models.StopSummary
+		stopsTotal int
+		routesLite []models.RouteMapLite
+	)
+	if len(filterRouteIDs) > 0 {
+		// Only stops served by selected routes within radius (requires DB; matches map filter UX).
+		params := repository.StopSearchParams{
+			Search:       "",
+			Lat:          &lat,
+			Lon:          &lon,
+			RadiusMeters: radius,
+			Limit:        stopLimit,
+			Page:         1,
+			RouteIDs:     filterRouteIDs,
+		}
+		stops, stopsTotal, err = s.repo.SearchStops(ctx, params)
+		if err != nil {
+			log.Printf("map static stops (route filter): %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to load map stops")
+			return
+		}
+		models.EnrichStopSummariesForMap(stops)
+		routesLite = s.mapStaticRoutesLiteOrdered(ctx, filterRouteIDs, routeSearch)
+	} else if s.snapshot != nil && s.snapshot.Loaded() {
+		stops, stopsTotal = s.snapshot.FilterStops("", &lat, &lon, radius, 1, stopLimit)
+		models.EnrichStopSummariesForMap(stops)
+		for _, rt := range s.snapshot.FilterRoutes(routeSearch, "", routeLimit) {
+			routesLite = append(routesLite, routeMapLite(rt))
+		}
+	} else {
+		params := repository.StopSearchParams{
+			Search:       "",
+			Lat:          &lat,
+			Lon:          &lon,
+			RadiusMeters: radius,
+			Limit:        stopLimit,
+			Page:         1,
+		}
+		stops, stopsTotal, err = s.repo.SearchStops(ctx, params)
+		if err != nil {
+			log.Printf("map static stops: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to load map stops")
+			return
+		}
+		models.EnrichStopSummariesForMap(stops)
+		routes, _, err := s.repo.SearchRoutes(ctx, repository.RouteSearchParams{
+			Search:    routeSearch,
+			RouteType: "",
+			Limit:     routeLimit,
+			Page:      1,
+		})
+		if err != nil {
+			log.Printf("map static routes: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to load map routes")
+			return
+		}
+		for i := range routes {
+			routesLite = append(routesLite, routeMapLite(routes[i]))
+		}
+	}
+
+	bundle := models.MapStaticBundle{Stops: stops, Routes: routesLite}
+	hasNext := stopsTotal > len(stops)
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   bundle,
+		Meta: &models.Meta{
+			Total:   stopsTotal,
+			Limit:   stopLimit,
+			Page:    1,
+			HasNext: hasNext,
+		},
+	})
+}
+
+// handleMapRoutesOverlay returns routes with legs: each leg has shape points + stops for one GTFS direction.
+// Query: routeIds=R1,R2&directionId=0 (optional)&maxPoints=1800&routeIdsKind=short_name
+func (s *Server) handleMapRoutesOverlay(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), mapOverlayTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("routeIds"))
+	multi := q["routeIds"]
+	var parts []string
+	if len(multi) > 1 {
+		parts = multi
+	} else if raw != "" {
+		parts = strings.Split(raw, ",")
+	}
+	if len(parts) == 0 {
+		httpError(w, http.StatusBadRequest, "routeIds is required (comma-separated or repeated query values)")
+		return
+	}
+
+	routeIdsKind := strings.ToLower(strings.TrimSpace(q.Get("routeIdsKind")))
+	byShortName := routeIdsKind == "short_name" || routeIdsKind == "short"
+
+	seen := make(map[string]struct{}, len(parts))
+	ids := make([]string, 0, len(parts))
+	var missing []string
+	for _, p := range parts {
+		token := strings.TrimSpace(p)
+		if token == "" {
+			continue
+		}
+		id := token
+		if byShortName {
+			rid, err := s.repo.LookupRouteIDByShortName(ctx, token)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					missing = append(missing, token)
+				} else {
+					log.Printf("map overlay resolve short_name %q: %v", token, err)
+					missing = append(missing, token)
+				}
+				continue
+			}
+			id = rid
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		if len(ids) >= maxOverlayRoutes {
+			break
+		}
+	}
+	if len(ids) == 0 {
+		httpError(w, http.StatusBadRequest, "no valid route ids after resolving (check route_id or use routeIdsKind=short_name)")
+		return
+	}
+
+	onlyDir := strings.TrimSpace(q.Get("directionId"))
+	maxPts := defaultOverlayShapePoints
+	if rawMP := q.Get("maxPoints"); rawMP != "" {
+		v, err := strconv.Atoi(rawMP)
+		if err != nil || v < 0 || v > maxShapePoints {
+			httpError(w, http.StatusBadRequest, "invalid maxPoints (0 for full resolution, or 50–25000)")
+			return
+		}
+		if v > 0 {
+			maxPts = clamp(v, minShapePoints, maxShapePoints)
+		} else {
+			maxPts = 0
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	routes := make([]models.MapRouteWithGeometry, 0, len(ids))
+	for _, routeID := range ids {
+		geo, err := s.repo.GetMapRouteWithGeometry(ctx, routeID, maxPts, onlyDir)
+		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				missing = append(missing, routeID)
+				continue
+			}
+			log.Printf("map routes overlay %s: %v", routeID, err)
+			missing = append(missing, routeID)
+			continue
+		}
+		routes = append(routes, *geo)
+	}
+
+	payload := models.MapRoutesOverlayPayload{Routes: routes}
+	meta := &models.Meta{
+		Total:           len(routes),
+		RequestedRoutes: len(ids),
+	}
+	if len(missing) > 0 {
+		meta.MissingRouteIds = missing
+	}
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   meta,
+	})
 }
 
 // ============================================================================
@@ -230,6 +576,24 @@ func (s *Server) handleStopDepartures(w http.ResponseWriter, r *http.Request) {
 		log.Printf("stop departures: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to fetch departures")
 		return
+	}
+	// Fallback: if nothing upcoming in the requested window, fetch from
+	// next morning so the UI can still show the next available service.
+	if len(departures) == 0 {
+		nextAt := time.Date(
+			at.Year(), at.Month(), at.Day()+1,
+			4, 0, 0, 0,
+			at.Location(),
+		)
+		departures, err = s.repo.GetStopDepartures(ctx, stopID, nextAt, 24*60, limit)
+		if err != nil {
+			log.Printf("stop departures fallback: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to fetch departures")
+			return
+		}
+		if len(departures) > 0 {
+			at = nextAt
+		}
 	}
 
 	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
@@ -394,6 +758,20 @@ func (s *Server) handleRouteShape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	directionID := strings.TrimSpace(r.URL.Query().Get("directionId"))
+	q := r.URL.Query()
+	maxPoints := defaultShapePoints
+	if raw := strings.TrimSpace(q.Get("maxPoints")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			httpError(w, http.StatusBadRequest, "invalid maxPoints (use 0 for full resolution, or a positive integer)")
+			return
+		}
+		if v == 0 {
+			maxPoints = 0
+		} else {
+			maxPoints = clamp(v, minShapePoints, maxShapePoints)
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
@@ -404,7 +782,7 @@ func (s *Server) handleRouteShape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shape, err := s.repo.GetRouteShape(ctx, routeID, directionID)
+	shape, err := s.repo.GetRouteShape(ctx, routeID, directionID, maxPoints)
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpError(w, http.StatusNotFound, "route shape not found")
 		return
@@ -568,12 +946,18 @@ func (s *Server) handleCalendarExceptions(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusBadRequest, "from and to are required (YYYY-MM-DD)")
 		return
 	}
-	if _, err := time.Parse("2006-01-02", from); err != nil {
+	fromT, err := time.Parse("2006-01-02", from)
+	if err != nil {
 		httpError(w, http.StatusBadRequest, "invalid from")
 		return
 	}
-	if _, err := time.Parse("2006-01-02", to); err != nil {
+	toT, err := time.Parse("2006-01-02", to)
+	if err != nil {
 		httpError(w, http.StatusBadRequest, "invalid to")
+		return
+	}
+	if toT.Before(fromT) {
+		httpError(w, http.StatusBadRequest, "from must be on or before to")
 		return
 	}
 
@@ -597,6 +981,190 @@ func (s *Server) handleCalendarExceptions(w http.ResponseWriter, r *http.Request
 		Status: status,
 		Data:   exceptions,
 		Meta:   &models.Meta{Total: len(exceptions)},
+	})
+}
+
+// handleCalendarDay resolves active service_ids for date D (GTFS calendar + calendar_dates add/remove).
+// Query: date=YYYY-MM-DD, detail=true (per-service calendar row, display, trips), include=window (feed min/max dates).
+func (s *Server) handleCalendarDay(w http.ResponseWriter, r *http.Request) {
+	date := r.URL.Query().Get("date")
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		writeAPIError(w, r, http.StatusBadRequest, "invalid_date", "invalid date (use YYYY-MM-DD)")
+		return
+	}
+	q := r.URL.Query()
+	detail := strings.EqualFold(q.Get("detail"), "true") || q.Get("detail") == "1"
+	include := q.Get("include")
+	includeWindow := strings.Contains(include, "window")
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "feed_state_error", "failed to read feed state")
+		return
+	}
+
+	active, err := s.repo.GetServiceCalendarOnDate(ctx, date)
+	if err != nil {
+		log.Printf("calendar day: %v", err)
+		writeAPIError(w, r, http.StatusInternalServerError, "calendar_query_error", "failed to resolve services for date")
+		return
+	}
+
+	events, err := s.repo.GetCalendarExceptions(ctx, date, date)
+	if err != nil {
+		log.Printf("calendar day events: %v", err)
+		events = nil
+	}
+
+	services := make([]models.ActiveServiceOnDay, 0, len(active))
+	for _, a := range active {
+		row := models.ActiveServiceOnDay{ServiceID: a.ServiceID, Source: a.Source}
+		if detail {
+			for _, e := range events {
+				if e.ServiceID == a.ServiceID {
+					row.ExceptionsToday = append(row.ExceptionsToday, e)
+				}
+			}
+			if cal, err := s.repo.GetCalendarService(ctx, a.ServiceID); err == nil {
+				row.Calendar = cal
+				lbl, desc := models.ServiceWeekdayLabel(cal)
+				tripN, _ := s.repo.CountTripsForService(ctx, a.ServiceID)
+				routes, _ := s.repo.RouteShortNamesForService(ctx, a.ServiceID)
+				row.Display = &models.ServiceDisplay{
+					Label: lbl, Description: desc, RouteShortNames: routes,
+					TripCount: tripN, HasTrips: tripN > 0,
+				}
+			} else {
+				tripN, _ := s.repo.CountTripsForService(ctx, a.ServiceID)
+				routes, _ := s.repo.RouteShortNamesForService(ctx, a.ServiceID)
+				row.Display = &models.ServiceDisplay{
+					Label: a.ServiceID, RouteShortNames: routes,
+					TripCount: tripN, HasTrips: tripN > 0,
+					Description: "Added by calendar_dates for this date (no base calendar row)",
+				}
+			}
+		}
+		services = append(services, row)
+	}
+
+	payload := models.CalendarDayPayload{
+		Date:               date,
+		Services:           services,
+		CalendarDateEvents: events,
+	}
+	if includeWindow {
+		win, err := s.repo.GetFeedCalendarWindow(ctx)
+		if err != nil {
+			log.Printf("calendar day window: %v", err)
+		} else if win != nil && (win.MinDate != "" || win.MaxDate != "") {
+			payload.FeedCalendarWindow = win
+		}
+	}
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   &models.Meta{Total: len(services), ServiceDate: date},
+	})
+}
+
+func (s *Server) handleFeedActive(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		writeAPIError(w, r, http.StatusInternalServerError, "feed_state_error", "failed to read feed state")
+		return
+	}
+
+	win, err := s.repo.GetFeedCalendarWindow(ctx)
+	if err != nil {
+		log.Printf("feed active window: %v", err)
+		writeAPIError(w, r, http.StatusInternalServerError, "calendar_window_error", "failed to read calendar coverage")
+		return
+	}
+
+	payload := models.FeedActivePayload{
+		CalendarWindow:     win,
+		LastSuccessfulSync: status.LastSuccessfulSync,
+	}
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+	})
+}
+
+func (s *Server) handleListCalendar(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	limit := clamp(parseIntOr(q.Get("limit"), defaultCalendarLimit), 1, maxCalendarLimit)
+	page := clamp(parseIntOr(q.Get("page"), 1), 1, 1_000_000)
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	services, total, err := s.repo.ListCalendarServices(ctx, page, limit)
+	if err != nil {
+		log.Printf("list calendar: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to fetch calendar services")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   services,
+		Meta: &models.Meta{
+			Total:   total,
+			Limit:   limit,
+			Page:    page,
+			HasNext: page*limit < total,
+		},
+	})
+}
+
+func (s *Server) handleGetCalendarService(w http.ResponseWriter, r *http.Request) {
+	serviceID := r.PathValue("serviceId")
+	if serviceID == "" {
+		httpError(w, http.StatusBadRequest, "missing service id")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	svc, err := s.repo.GetCalendarService(ctx, serviceID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpError(w, http.StatusNotFound, "calendar service not found")
+		return
+	}
+	if err != nil {
+		log.Printf("get calendar service: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to fetch calendar service")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   svc,
 	})
 }
 
@@ -651,6 +1219,10 @@ type verifyOTPPayload struct {
 	Email string `json:"email,omitempty"`
 	Token string `json:"token"`
 	Type  string `json:"type"` // signup, email, recovery, magiclink, email_change
+}
+
+type favoriteRoutePayload struct {
+	RouteID string `json:"route_id"`
 }
 
 func (s *Server) handleAuthSignup(w http.ResponseWriter, r *http.Request) {
@@ -748,9 +1320,110 @@ func (s *Server) handleAuth(w http.ResponseWriter, r *http.Request, signup bool)
 	writeJSON(w, statusCodeOr(statusCode, http.StatusOK), resp)
 }
 
+func (s *Server) handleListFavoriteRoutes(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	userID, err := s.requireUserID(ctx, r)
+	if err != nil {
+		httpError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	favorites, err := s.repo.ListFavoriteRoutes(ctx, userID)
+	if err != nil {
+		log.Printf("list favorite routes: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to list favorite routes")
+		return
+	}
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: models.APIStatus{Mode: models.ModeNormal},
+		Data:   favorites,
+		Meta:   &models.Meta{Total: len(favorites)},
+	})
+}
+
+func (s *Server) handleAddFavoriteRoute(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	userID, err := s.requireUserID(ctx, r)
+	if err != nil {
+		httpError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	var body favoriteRoutePayload
+	if err = json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid json body")
+		return
+	}
+	routeID := strings.TrimSpace(body.RouteID)
+	if routeID == "" {
+		httpError(w, http.StatusBadRequest, "route_id is required")
+		return
+	}
+	if err = s.repo.AddFavoriteRoute(ctx, userID, routeID); err != nil {
+		log.Printf("add favorite route: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to add favorite route")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleDeleteFavoriteRoute(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+
+	userID, err := s.requireUserID(ctx, r)
+	if err != nil {
+		httpError(w, http.StatusUnauthorized, err.Error())
+		return
+	}
+	routeID := strings.TrimSpace(r.PathValue("routeId"))
+	if routeID == "" {
+		httpError(w, http.StatusBadRequest, "missing route id")
+		return
+	}
+	if err = s.repo.DeleteFavoriteRoute(ctx, userID, routeID); err != nil {
+		log.Printf("delete favorite route: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to delete favorite route")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
+
+func bearerToken(r *http.Request) string {
+	authz := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authz == "" {
+		return ""
+	}
+	parts := strings.SplitN(authz, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(parts[1])
+}
+
+func (s *Server) requireUserID(ctx context.Context, r *http.Request) (string, error) {
+	if s.auth == nil || !s.auth.Enabled() {
+		return "", errors.New("supabase auth is not configured")
+	}
+	token := bearerToken(r)
+	if token == "" {
+		return "", errors.New("missing bearer token")
+	}
+	user, statusCode, err := s.auth.GetUser(ctx, token)
+	if err != nil {
+		if statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden {
+			return "", errors.New("invalid bearer token")
+		}
+		return "", fmt.Errorf("auth user lookup failed")
+	}
+	return user.ID, nil
+}
 
 func parseIntOr(raw string, fallback int) int {
 	if raw == "" {
@@ -786,6 +1459,29 @@ func optionalFloat(values map[string][]string, key string) (*float64, error) {
 
 func httpError(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
+}
+
+func newRequestID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err != nil {
+		return strconv.FormatInt(time.Now().UnixNano(), 36)
+	}
+	return hex.EncodeToString(b)
+}
+
+// writeAPIError returns { "error": { "code", "message", "request_id" } } and sets X-Request-ID.
+func writeAPIError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	rid := r.Header.Get("X-Request-ID")
+	if rid == "" {
+		rid = r.Header.Get("X-Request-Id")
+	}
+	if rid == "" {
+		rid = newRequestID()
+	}
+	w.Header().Set("X-Request-ID", rid)
+	writeJSON(w, status, models.ErrorEnvelope{
+		Error: models.APIError{Code: code, Message: message, RequestID: rid},
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

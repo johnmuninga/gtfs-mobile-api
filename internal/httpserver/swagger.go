@@ -34,6 +34,10 @@ func (s *Server) handleSwaggerUI(w http.ResponseWriter, _ *http.Request) {
 	_, _ = w.Write([]byte(swaggerHTML))
 }
 
+func (s *Server) handleSwaggerRoot(w http.ResponseWriter, r *http.Request) {
+	http.Redirect(w, r, "/swagger", http.StatusTemporaryRedirect)
+}
+
 func (s *Server) handleOpenAPI(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
 	_, _ = w.Write(openAPISpec)

@@ -36,6 +36,10 @@ type AuthResponse struct {
 	User         map[string]any `json:"user,omitempty"`
 }
 
+type UserResponse struct {
+	ID string `json:"id"`
+}
+
 type ErrorResponse struct {
 	Error            string `json:"error,omitempty"`
 	ErrorDescription string `json:"error_description,omitempty"`
@@ -65,6 +69,40 @@ func (c *Client) Login(ctx context.Context, req AuthRequest) (*AuthResponse, int
 
 func (c *Client) VerifyOTP(ctx context.Context, req VerifyOTPRequest) (*AuthResponse, int, error) {
 	return c.postJSON(ctx, "/auth/v1/verify", req)
+}
+
+func (c *Client) GetUser(ctx context.Context, accessToken string) (*UserResponse, int, error) {
+	if !c.Enabled() {
+		return nil, http.StatusServiceUnavailable, fmt.Errorf("supabase auth is not configured")
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/auth/v1/user", nil)
+	if err != nil {
+		return nil, http.StatusInternalServerError, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("apikey", c.apiKey)
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	res, err := c.http.Do(req)
+	if err != nil {
+		return nil, http.StatusBadGateway, fmt.Errorf("request supabase user: %w", err)
+	}
+	defer res.Body.Close()
+
+	if res.StatusCode >= 400 {
+		var e ErrorResponse
+		_ = json.NewDecoder(res.Body).Decode(&e)
+		msg := firstNonEmpty(e.ErrorDescription, e.Message, e.Msg, e.Error, "supabase user request failed")
+		return nil, res.StatusCode, fmt.Errorf("%s", msg)
+	}
+
+	var out UserResponse
+	if err = json.NewDecoder(res.Body).Decode(&out); err != nil {
+		return nil, http.StatusBadGateway, fmt.Errorf("decode supabase user response: %w", err)
+	}
+	if strings.TrimSpace(out.ID) == "" {
+		return nil, http.StatusBadGateway, fmt.Errorf("supabase user response missing id")
+	}
+	return &out, res.StatusCode, nil
 }
 
 func (c *Client) postJSON(ctx context.Context, path string, payload any) (*AuthResponse, int, error) {

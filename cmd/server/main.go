@@ -4,6 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
+	"os"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -50,6 +51,7 @@ func main() {
 	}
 
 	server := httpserver.New(cfg, repo, snap, authClient)
+	usingRailway := runningOnRailway()
 
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -58,7 +60,7 @@ func main() {
 	}
 
 	var redirectSrv *http.Server
-	if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" && cfg.ForceHTTPSRedirect {
+	if !usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" && cfg.ForceHTTPSRedirect {
 		redirectSrv = &http.Server{
 			Addr:              ":" + cfg.HTTPRedirectPort,
 			Handler:           redirectToHTTPSHandler(cfg.Port),
@@ -67,7 +69,7 @@ func main() {
 	}
 
 	go func() {
-		if cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+		if !usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
 			log.Printf("https server listening on :%s", cfg.Port)
 			if redirectSrv != nil {
 				go func() {
@@ -84,6 +86,9 @@ func main() {
 			return
 		}
 
+		if usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
+			log.Printf("railway detected: ignoring TLS_CERT_FILE/TLS_KEY_FILE and serving plain HTTP on :%s", cfg.Port)
+		}
 		log.Printf("http server listening on :%s", cfg.Port)
 		if serveErr := httpSrv.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Fatalf("http serve: %v", serveErr)
@@ -116,4 +121,10 @@ func redirectToHTTPSHandler(httpsPort string) http.Handler {
 		target += r.URL.RequestURI()
 		http.Redirect(w, r, target, http.StatusPermanentRedirect)
 	})
+}
+
+func runningOnRailway() bool {
+	return os.Getenv("RAILWAY_ENVIRONMENT") != "" ||
+		os.Getenv("RAILWAY_PROJECT_ID") != "" ||
+		os.Getenv("RAILWAY_SERVICE_ID") != ""
 }

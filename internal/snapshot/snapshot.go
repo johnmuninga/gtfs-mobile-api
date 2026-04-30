@@ -94,6 +94,18 @@ func (s *Snapshot) RoutesCount() int {
 	return len(s.routes)
 }
 
+// RouteByID returns a cached route if present.
+func (s *Snapshot) RouteByID(routeID string) (models.Route, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for i := range s.routes {
+		if s.routes[i].RouteID == routeID {
+			return s.routes[i], true
+		}
+	}
+	return models.Route{}, false
+}
+
 func (s *Snapshot) StopsCount() int {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
