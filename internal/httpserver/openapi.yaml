@@ -7,8 +7,8 @@ info:
     All responses follow the envelope `{ status, data, meta? }`.
     `status.mode` becomes `static_only` if the GTFS realtime feed has not synced recently.
 servers:
+  - url: https://gtfs-mobile-api-production.up.railway.app
   - url: http://localhost:8080
-  - url: https://localhost:8443
 tags:
   - name: Health
   - name: Auth
