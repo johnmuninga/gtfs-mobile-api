@@ -4,9 +4,7 @@ import (
 	"context"
 	"log"
 	"net/http"
-	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -51,7 +49,6 @@ func main() {
 	}
 
 	server := httpserver.New(cfg, repo, snap, authClient)
-	usingRailway := runningOnRailway()
 
 	httpSrv := &http.Server{
 		Addr:              ":" + cfg.Port,
@@ -59,36 +56,7 @@ func main() {
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
-	var redirectSrv *http.Server
-	if !usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" && cfg.ForceHTTPSRedirect {
-		redirectSrv = &http.Server{
-			Addr:              ":" + cfg.HTTPRedirectPort,
-			Handler:           redirectToHTTPSHandler(cfg.Port),
-			ReadHeaderTimeout: 5 * time.Second,
-		}
-	}
-
 	go func() {
-		if !usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-			log.Printf("https server listening on :%s", cfg.Port)
-			if redirectSrv != nil {
-				go func() {
-					log.Printf("http redirect server listening on :%s", cfg.HTTPRedirectPort)
-					if err := redirectSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-						log.Printf("http redirect server error: %v", err)
-					}
-				}()
-			}
-
-			if serveErr := httpSrv.ListenAndServeTLS(cfg.TLSCertFile, cfg.TLSKeyFile); serveErr != nil && serveErr != http.ErrServerClosed {
-				log.Fatalf("https serve: %v", serveErr)
-			}
-			return
-		}
-
-		if usingRailway && cfg.TLSCertFile != "" && cfg.TLSKeyFile != "" {
-			log.Printf("railway detected: ignoring TLS_CERT_FILE/TLS_KEY_FILE and serving plain HTTP on :%s", cfg.Port)
-		}
 		log.Printf("http server listening on :%s", cfg.Port)
 		if serveErr := httpSrv.ListenAndServe(); serveErr != nil && serveErr != http.ErrServerClosed {
 			log.Fatalf("http serve: %v", serveErr)
@@ -101,30 +69,4 @@ func main() {
 	if shutdownErr := httpSrv.Shutdown(shutdownCtx); shutdownErr != nil {
 		log.Printf("graceful shutdown failed: %v", shutdownErr)
 	}
-	if redirectSrv != nil {
-		if shutdownErr := redirectSrv.Shutdown(shutdownCtx); shutdownErr != nil {
-			log.Printf("redirect server shutdown failed: %v", shutdownErr)
-		}
-	}
-}
-
-func redirectToHTTPSHandler(httpsPort string) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		host := r.Host
-		if strings.Contains(host, ":") {
-			host = strings.Split(host, ":")[0]
-		}
-		target := "https://" + host
-		if httpsPort != "443" {
-			target += ":" + httpsPort
-		}
-		target += r.URL.RequestURI()
-		http.Redirect(w, r, target, http.StatusPermanentRedirect)
-	})
-}
-
-func runningOnRailway() bool {
-	return os.Getenv("RAILWAY_ENVIRONMENT") != "" ||
-		os.Getenv("RAILWAY_PROJECT_ID") != "" ||
-		os.Getenv("RAILWAY_SERVICE_ID") != ""
 }

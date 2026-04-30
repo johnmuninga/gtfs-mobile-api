@@ -15,10 +15,6 @@ type Config struct {
 	APIDegradedMinutes        int
 	NearbyDefaultRadiusMeters int
 	SnapshotRefreshMinutes    int
-	TLSCertFile               string
-	TLSKeyFile                string
-	ForceHTTPSRedirect        bool
-	HTTPRedirectPort          string
 }
 
 func Load() (Config, error) {
@@ -31,10 +27,6 @@ func Load() (Config, error) {
 		APIDegradedMinutes:        getenvInt("API_DEGRADED_MINUTES", 15),
 		NearbyDefaultRadiusMeters: getenvInt("NEARBY_DEFAULT_RADIUS_METERS", 1000),
 		SnapshotRefreshMinutes:    getenvInt("SNAPSHOT_REFRESH_MINUTES", 10),
-		TLSCertFile:               os.Getenv("TLS_CERT_FILE"),
-		TLSKeyFile:                os.Getenv("TLS_KEY_FILE"),
-		ForceHTTPSRedirect:        getenvBool("FORCE_HTTPS_REDIRECT", false),
-		HTTPRedirectPort:          getenv("HTTP_REDIRECT_PORT", "8080"),
 	}
 
 	if cfg.SupabaseDBURL == "" {
@@ -63,15 +55,3 @@ func getenvInt(key string, fallback int) int {
 	return n
 }
 
-func getenvBool(key string, fallback bool) bool {
-	v := os.Getenv(key)
-	if v == "" {
-		return fallback
-	}
-
-	parsed, err := strconv.ParseBool(v)
-	if err != nil {
-		return fallback
-	}
-	return parsed
-}

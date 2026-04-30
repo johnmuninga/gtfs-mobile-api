@@ -14,9 +14,6 @@
 coverage.out
 coverage.txt
 
-# Local TLS certs
-certs/
-
 # Logs
 *.log
 

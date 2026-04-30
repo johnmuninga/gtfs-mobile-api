@@ -46,29 +46,6 @@ Then open:
 
 - `http://localhost:8080/swagger`
 
-## HTTPS
-
-To run HTTPS directly from this Go service, set:
-
-- `TLS_CERT_FILE` (path to PEM certificate)
-- `TLS_KEY_FILE` (path to PEM private key)
-
-Optional:
-
-- `FORCE_HTTPS_REDIRECT=true` to redirect HTTP traffic to HTTPS
-- `HTTP_REDIRECT_PORT=8080` for the plain HTTP redirect listener
-
-Example:
-
-```bash
-export PORT=8443
-export TLS_CERT_FILE=./certs/server.crt
-export TLS_KEY_FILE=./certs/server.key
-export FORCE_HTTPS_REDIRECT=true
-export HTTP_REDIRECT_PORT=8080
-go run ./cmd/server
-```
-
 ## Recommended SQL indexes
 
 ```sql
