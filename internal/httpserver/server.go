@@ -49,6 +49,10 @@ const (
 	maxCalendarLimit          = 500
 	requestTimeout            = 5 * time.Second
 	mapOverlayTimeout         = 25 * time.Second
+	routeShapeCacheTTL        = 2 * time.Minute
+	mapOverlayCacheTTL        = 45 * time.Second
+	feedActiveCacheTTL        = 30 * time.Second
+	vehiclesCacheTTL          = 5 * time.Second
 )
 
 type Server struct {
@@ -407,19 +411,36 @@ func (s *Server) handleMapRoutesOverlay(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	overlayCacheKey := "map_overlay:" + strings.Join(ids, ",") + "|" + onlyDir + "|" + strconv.Itoa(maxPts) + "|" + string(status.Mode)
+
 	routes := make([]models.MapRouteWithGeometry, 0, len(ids))
-	for _, routeID := range ids {
-		geo, err := s.repo.GetMapRouteWithGeometry(ctx, routeID, maxPts, onlyDir)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
+	if cached, ok := s.cache.Get(overlayCacheKey); ok {
+		if hit, ok := cached.(struct {
+			Routes  []models.MapRouteWithGeometry
+			Missing []string
+		}); ok {
+			routes = hit.Routes
+			missing = append(missing, hit.Missing...)
+		}
+	}
+	if routes == nil {
+		for _, routeID := range ids {
+			geo, err := s.repo.GetMapRouteWithGeometry(ctx, routeID, maxPts, onlyDir)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					missing = append(missing, routeID)
+					continue
+				}
+				log.Printf("map routes overlay %s: %v", routeID, err)
 				missing = append(missing, routeID)
 				continue
 			}
-			log.Printf("map routes overlay %s: %v", routeID, err)
-			missing = append(missing, routeID)
-			continue
+			routes = append(routes, *geo)
 		}
-		routes = append(routes, *geo)
+		s.cache.SetWithTTL(overlayCacheKey, struct {
+			Routes  []models.MapRouteWithGeometry
+			Missing []string
+		}{Routes: routes, Missing: missing}, mapOverlayCacheTTL)
 	}
 
 	payload := models.MapRoutesOverlayPayload{Routes: routes}
@@ -783,15 +804,25 @@ func (s *Server) handleRouteShape(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	shape, err := s.repo.GetRouteShape(ctx, routeID, directionID, maxPoints)
-	if errors.Is(err, pgx.ErrNoRows) {
-		httpError(w, http.StatusNotFound, "route shape not found")
-		return
+	shapeCacheKey := "route_shape:" + routeID + "|" + directionID + "|" + strconv.Itoa(maxPoints) + "|" + string(status.Mode)
+	var shape *models.RouteShape
+	if cached, ok := s.cache.Get(shapeCacheKey); ok {
+		if hit, ok := cached.(*models.RouteShape); ok {
+			shape = hit
+		}
 	}
-	if err != nil {
-		log.Printf("route shape: %v", err)
-		httpError(w, http.StatusInternalServerError, "failed to fetch route shape")
-		return
+	if shape == nil {
+		shape, err = s.repo.GetRouteShape(ctx, routeID, directionID, maxPoints)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpError(w, http.StatusNotFound, "route shape not found")
+			return
+		}
+		if err != nil {
+			log.Printf("route shape: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to fetch route shape")
+			return
+		}
+		s.cache.SetWithTTL(shapeCacheKey, shape, routeShapeCacheTTL)
 	}
 
 	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
@@ -1079,6 +1110,14 @@ func (s *Server) handleFeedActive(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
+	const feedCacheKey = "feed_active_payload"
+	if cached, ok := s.cache.Get(feedCacheKey); ok {
+		if hit, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, hit)
+			return
+		}
+	}
+
 	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
 	if err != nil {
 		writeAPIError(w, r, http.StatusInternalServerError, "feed_state_error", "failed to read feed state")
@@ -1097,10 +1136,12 @@ func (s *Server) handleFeedActive(w http.ResponseWriter, r *http.Request) {
 		LastSuccessfulSync: status.LastSuccessfulSync,
 	}
 
-	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   payload,
-	})
+	}
+	s.cache.SetWithTTL(feedCacheKey, resp, feedActiveCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleListCalendar(w http.ResponseWriter, r *http.Request) {
@@ -1177,6 +1218,14 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
+	const vehiclesCacheKey = "vehicles_payload"
+	if cached, ok := s.cache.Get(vehiclesCacheKey); ok {
+		if hit, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, hit)
+			return
+		}
+	}
+
 	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "failed to read feed state")
@@ -1190,11 +1239,13 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   vehicles,
 		Meta:   &models.Meta{Total: len(vehicles)},
-	})
+	}
+	s.cache.SetWithTTL(vehiclesCacheKey, resp, vehiclesCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ============================================================================

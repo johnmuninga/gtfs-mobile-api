@@ -80,3 +80,14 @@ on trip_update_stop_times_current (trip_id, stop_id);
 create index if not exists idx_stops_geog
 on stops using gist ((st_setsrid(st_makepoint(stop_lon, stop_lat), 4326)::geography));
 ```
+
+## Materialized view refresh
+
+`migrations/008_route_stop_map_and_hot_indexes.sql` adds `mv_route_stop_map` used by route-filtered stop queries.
+After GTFS static imports, refresh it:
+
+```sql
+REFRESH MATERIALIZED VIEW CONCURRENTLY mv_route_stop_map;
+```
+
+If the view is not present yet, API queries automatically fall back to the base `trips + stop_times` join.

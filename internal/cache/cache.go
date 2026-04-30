@@ -47,6 +47,15 @@ func (c *TTLCache) Set(key string, value any) {
 	c.mu.Unlock()
 }
 
+func (c *TTLCache) SetWithTTL(key string, value any, ttl time.Duration) {
+	if ttl <= 0 {
+		ttl = c.ttl
+	}
+	c.mu.Lock()
+	c.entries[key] = entry{value: value, expiresAt: time.Now().Add(ttl)}
+	c.mu.Unlock()
+}
+
 func (c *TTLCache) Invalidate(key string) {
 	c.mu.Lock()
 	delete(c.entries, key)

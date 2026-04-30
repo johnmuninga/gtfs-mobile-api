@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"backend_mobile_app_go/internal/models"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -56,6 +58,10 @@ type StopSearchParams struct {
 }
 
 func (r *Repository) SearchStops(ctx context.Context, p StopSearchParams) ([]models.StopSummary, int, error) {
+	return r.searchStops(ctx, p, true)
+}
+
+func (r *Repository) searchStops(ctx context.Context, p StopSearchParams, useRouteStopMV bool) ([]models.StopSummary, int, error) {
 	var (
 		filters []string
 		args    []any
@@ -86,14 +92,26 @@ func (r *Repository) SearchStops(ctx context.Context, p StopSearchParams) ([]mod
 
 	if len(p.RouteIDs) > 0 {
 		args = append(args, p.RouteIDs)
-		filters = append(filters, fmt.Sprintf(
-			`EXISTS (
-				SELECT 1 FROM stop_times st
-				JOIN trips t ON t.trip_id = st.trip_id
-				WHERE st.stop_id = stops.stop_id AND t.route_id = ANY($%d::text[])
-			)`,
-			len(args),
-		))
+		if useRouteStopMV {
+			filters = append(filters, fmt.Sprintf(
+				`EXISTS (
+					SELECT 1
+					FROM mv_route_stop_map rsm
+					WHERE rsm.stop_id = stops.stop_id
+					  AND rsm.route_id = ANY($%d::text[])
+				)`,
+				len(args),
+			))
+		} else {
+			filters = append(filters, fmt.Sprintf(
+				`EXISTS (
+					SELECT 1 FROM stop_times st
+					JOIN trips t ON t.trip_id = st.trip_id
+					WHERE st.stop_id = stops.stop_id AND t.route_id = ANY($%d::text[])
+				)`,
+				len(args),
+			))
+		}
 	}
 
 	where := ""
@@ -104,6 +122,9 @@ func (r *Repository) SearchStops(ctx context.Context, p StopSearchParams) ([]mod
 	countQuery := fmt.Sprintf(`SELECT COUNT(*) FROM stops %s`, where)
 	var total int
 	if err := r.pool.QueryRow(ctx, countQuery, args...).Scan(&total); err != nil {
+		if useRouteStopMV && len(p.RouteIDs) > 0 && isUndefinedTableErr(err, "mv_route_stop_map") {
+			return r.searchStops(ctx, p, false)
+		}
 		return nil, 0, fmt.Errorf("count search stops: %w", err)
 	}
 
@@ -128,6 +149,9 @@ LIMIT $%d OFFSET $%d
 
 	rows, err := r.pool.Query(ctx, q, args...)
 	if err != nil {
+		if useRouteStopMV && len(p.RouteIDs) > 0 && isUndefinedTableErr(err, "mv_route_stop_map") {
+			return r.searchStops(ctx, p, false)
+		}
 		return nil, 0, fmt.Errorf("query search stops: %w", err)
 	}
 	defer rows.Close()
@@ -141,6 +165,14 @@ LIMIT $%d OFFSET $%d
 		out = append(out, s)
 	}
 	return out, total, rows.Err()
+}
+
+func isUndefinedTableErr(err error, relation string) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42P01" && (relation == "" || strings.Contains(pgErr.Message, relation))
+	}
+	return false
 }
 
 // ListAllStops returns every stop as a lightweight summary.
