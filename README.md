@@ -21,6 +21,8 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 ## Endpoints
 
 - `GET /v1/map/vehicles` - active vehicles from `vehicle_positions_current`
+- `GET /v1/realtime/trip-updates?limit=500` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); `data` is a JSON array matching your DB columns
+- `GET /v1/realtime/alerts?limit=500` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); `data` is a JSON array matching your DB columns
 - `GET /v1/routes` - route list from `routes`
 - `GET /v1/stops/{id}/schedule` - next 5 departures, realtime fallback to static
 - `GET /v1/stops/nearby?lat={lat}&lon={lon}&radius_meters={r}` - nearby stop search
@@ -51,6 +53,10 @@ Set:
 - `API_DEGRADED_MINUTES` (default `15`)
 - `NEARBY_DEFAULT_RADIUS_METERS` (default `1000`)
 - `HEALTHCHECK_SECRET` (optional, for `GET /healthz` probes without a user token)
+- `REALTIME_TRIP_UPDATES_TABLE` (optional, default `trip_updates_current`) — Postgres table or view for live trip updates
+- `REALTIME_ALERTS_TABLE` (optional, default `service_alerts_current`) — Postgres table or view for service alerts
+
+If your ingest uses different table names, set these env vars or create SQL **views** with the default names that `SELECT` from your real tables.
 
 ## Run
 

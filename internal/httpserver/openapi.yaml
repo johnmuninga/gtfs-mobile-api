@@ -678,6 +678,44 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/VehiclesResponse" }
 
+  /v1/realtime/trip-updates:
+    get:
+      tags: [Realtime]
+      summary: Live trip updates (raw rows from database)
+      description: |
+        Reads the table named by `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`).
+        `data` is a JSON array of objects; keys match your table columns so any ingest schema works.
+      parameters:
+        - in: query
+          name: limit
+          description: Max rows (default 500, max 2000)
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RealtimeJSONArrayResponse" }
+
+  /v1/realtime/alerts:
+    get:
+      tags: [Realtime]
+      summary: Live service alerts (raw rows from database)
+      description: |
+        Reads the table named by `REALTIME_ALERTS_TABLE` (default `service_alerts_current`).
+        `data` is a JSON array of objects matching your alert table columns.
+      parameters:
+        - in: query
+          name: limit
+          description: Max rows (default 500, max 2000)
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 500 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RealtimeJSONArrayResponse" }
+
 components:
   securitySchemes:
     bearerAuth:
@@ -1195,4 +1233,13 @@ components:
         data:
           type: array
           items: { $ref: "#/components/schemas/Vehicle" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    RealtimeJSONArrayResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data:
+          type: array
+          items: { type: object, additionalProperties: true }
         meta: { $ref: "#/components/schemas/Meta" }

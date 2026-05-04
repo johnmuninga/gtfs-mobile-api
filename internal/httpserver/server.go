@@ -53,6 +53,10 @@ const (
 	mapOverlayCacheTTL        = 45 * time.Second
 	feedActiveCacheTTL        = 30 * time.Second
 	vehiclesCacheTTL          = 5 * time.Second
+	realtimeTripCacheTTL      = 8 * time.Second
+	realtimeAlertsCacheTTL    = 20 * time.Second
+	defaultRealtimeLimit      = 500
+	maxRealtimeLimit          = 2000
 )
 
 type Server struct {
@@ -121,6 +125,8 @@ func (s *Server) Router() http.Handler {
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
+	mux.Handle("GET /v1/realtime/trip-updates", dynamicCache(http.HandlerFunc(s.handleRealtimeTripUpdates)))
+	mux.Handle("GET /v1/realtime/alerts", dynamicCache(http.HandlerFunc(s.handleRealtimeAlerts)))
 
 	return recoverMiddleware(gzipMiddleware(s.authMiddleware(mux)))
 }
@@ -1246,6 +1252,89 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cache.SetWithTTL(vehiclesCacheKey, resp, vehiclesCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleRealtimeTripUpdates returns rows from REALTIME_TRIP_UPDATES_TABLE (default trip_updates_current)
+// as a JSON array so any column layout from your ingest pipeline is forwarded to the app.
+func (s *Server) handleRealtimeTripUpdates(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	limit := clamp(parseIntOr(r.URL.Query().Get("limit"), defaultRealtimeLimit), 1, maxRealtimeLimit)
+	tbl := strings.TrimSpace(s.cfg.RealtimeTripUpdatesTable)
+	cacheKey := "rt_trip_updates:" + tbl + ":" + strconv.Itoa(limit)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	raw, err := s.repo.SelectTableAsJSONArray(ctx, tbl, limit)
+	if err != nil {
+		log.Printf("realtime trip-updates: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to fetch trip updates")
+		return
+	}
+
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   raw,
+		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, realtimeTripCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleRealtimeAlerts returns rows from REALTIME_ALERTS_TABLE (default service_alerts_current) as JSON array.
+func (s *Server) handleRealtimeAlerts(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	limit := clamp(parseIntOr(r.URL.Query().Get("limit"), defaultRealtimeLimit), 1, maxRealtimeLimit)
+	tbl := strings.TrimSpace(s.cfg.RealtimeAlertsTable)
+	cacheKey := "rt_alerts:" + tbl + ":" + strconv.Itoa(limit)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	raw, err := s.repo.SelectTableAsJSONArray(ctx, tbl, limit)
+	if err != nil {
+		log.Printf("realtime alerts: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to fetch alerts")
+		return
+	}
+
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   raw,
+		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, realtimeAlertsCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func jsonArrayLen(raw json.RawMessage) int {
+	var arr []any
+	if err := json.Unmarshal(raw, &arr); err != nil {
+		return 0
+	}
+	return len(arr)
 }
 
 // ============================================================================
