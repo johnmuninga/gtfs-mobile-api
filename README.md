@@ -21,7 +21,7 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 ## Endpoints
 
 - `GET /v1/map/vehicles` - active vehicles; canonical `route_id` (realtime row or `trips.route_id`), plus `route_short_name` / `route_long_name` from static `routes` when the route exists
-- `GET /v1/map/routes-with-live-vehicles` - `{ routes: [{ route_id, live_vehicle_count }], unassigned_vehicle_count, total_vehicles }` for route picker badges (merge with static route list for zeros)
+- `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`
 - `GET /v1/realtime/trip-updates?limit=500` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); `data` is a JSON array matching your DB columns
 - `GET /v1/realtime/alerts?limit=500` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); `data` is a JSON array matching your DB columns
 - `GET /v1/routes` - route list from `routes`

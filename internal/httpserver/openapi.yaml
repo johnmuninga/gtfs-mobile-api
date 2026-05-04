@@ -686,6 +686,17 @@ paths:
       summary: Live vehicle counts per canonical route_id
       description: |
         For route pickers: merge this with `GET /v1/gtfs/routes` or map static routes. `data.routes` lists only routes with at least one vehicle; `unassigned_vehicle_count` is positions that could not be tied to a GTFS route_id.
+
+        Set `includeUnassignedHints=1` to add `data.unassigned_hints`: each unassigned vehicle’s lat/lon plus **heuristic** `possible_route_ids` from the nearest stop (not guaranteed to be the vehicle’s line). When several routes share that stop, `ranked_routes` orders candidates by min distance (m) to each route’s dominant GTFS shape; `best_route_id` is set only when that geometry signal is confident (single candidate, or closest within 500 m and ≥20 m ahead of the next).
+      parameters:
+        - in: query
+          name: includeUnassignedHints
+          description: If true or 1, include unassigned_hints (nearest-stop heuristic; slower).
+          schema: { type: string, enum: ["0", "1", "true", "false"] }
+        - in: query
+          name: maxUnassignedHints
+          description: Max unassigned vehicles to analyze (default 80, max 150); only when hints enabled.
+          schema: { type: integer, minimum: 1, maximum: 150, default: 80 }
       responses:
         "200":
           description: OK
@@ -897,6 +908,41 @@ components:
           items: { $ref: "#/components/schemas/RouteLiveVehicleCount" }
         unassigned_vehicle_count: { type: integer, minimum: 0 }
         total_vehicles: { type: integer, minimum: 0 }
+        unassigned_hints:
+          type: array
+          items: { $ref: "#/components/schemas/UnassignedVehicleHint" }
+
+    RouteProximityRank:
+      type: object
+      required: [route_id, distance_m]
+      properties:
+        route_id: { type: string }
+        distance_m:
+          type: number
+          description: Min distance from vehicle point to that route’s dominant shape vertices (WGS84 geography).
+
+    UnassignedVehicleHint:
+      type: object
+      properties:
+        vehicle_id: { type: string }
+        trip_id: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        bearing: { type: number }
+        speed: { type: number }
+        nearest_stop_id: { type: string }
+        nearest_stop_distance_m: { type: number }
+        possible_route_ids:
+          type: array
+          items: { type: string }
+          description: Routes serving nearest stop — heuristic only
+        ranked_routes:
+          type: array
+          items: { $ref: "#/components/schemas/RouteProximityRank" }
+          description: At most 6 candidates, ordered by distance_m ascending (shape geometry).
+        best_route_id:
+          type: string
+          description: Suggested line when unambiguous (single possible_route_id, or clear winner vs next by shape distance).
 
     RoutesWithLiveVehiclesResponse:
       type: object

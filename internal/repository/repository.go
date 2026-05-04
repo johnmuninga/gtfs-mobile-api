@@ -1285,3 +1285,222 @@ ORDER BY route_id
 	return out, rows.Err()
 }
 
+const maxPossibleRoutesPerHint = 8
+
+// GetUnassignedVehicleHints returns up to maxVehicles unassigned positions with nearest-stop distance
+// and possible_route_ids (routes serving that stop). This is a heuristic for UI only, not ground truth.
+func (r *Repository) GetUnassignedVehicleHints(ctx context.Context, maxVehicles int) ([]models.UnassignedVehicleHint, error) {
+	if maxVehicles <= 0 {
+		maxVehicles = 80
+	}
+	if maxVehicles > 150 {
+		maxVehicles = 150
+	}
+	const q = `
+WITH unassigned AS (
+	SELECT
+		v.vehicle_id,
+		COALESCE(v.trip_id, '') AS trip_id,
+		v.latitude AS lat,
+		v.longitude AS lon,
+		v.bearing,
+		v.speed
+	FROM vehicle_positions_current v
+	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	WHERE v.latitude IS NOT NULL
+	  AND v.longitude IS NOT NULL
+	  AND COALESCE(
+			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+			''
+		) = ''
+	LIMIT $1
+),
+nearest AS (
+	SELECT
+		u.vehicle_id,
+		u.trip_id,
+		u.lat,
+		u.lon,
+		u.bearing,
+		u.speed,
+		s.stop_id AS nearest_stop_id,
+		ST_Distance(
+			ST_SetSRID(ST_MakePoint(s.stop_lon, s.stop_lat), 4326)::geography,
+			ST_SetSRID(ST_MakePoint(u.lon, u.lat), 4326)::geography
+		)::double precision AS nearest_stop_m
+	FROM unassigned u
+	CROSS JOIN LATERAL (
+		SELECT stop_id, stop_lon, stop_lat
+		FROM stops
+		WHERE stop_lat IS NOT NULL AND stop_lon IS NOT NULL
+		ORDER BY
+			ST_SetSRID(ST_MakePoint(stop_lon, stop_lat), 4326)::geography
+			<-> ST_SetSRID(ST_MakePoint(u.lon, u.lat), 4326)::geography
+		LIMIT 1
+	) s
+)
+SELECT
+	n.vehicle_id,
+	n.trip_id,
+	n.lat,
+	n.lon,
+	n.bearing,
+	n.speed,
+	n.nearest_stop_id,
+	n.nearest_stop_m,
+	COALESCE(string_agg(DISTINCT t.route_id, ',' ORDER BY t.route_id), '')
+FROM nearest n
+JOIN stop_times st ON st.stop_id = n.nearest_stop_id
+JOIN trips t ON t.trip_id = st.trip_id AND COALESCE(TRIM(t.route_id), '') <> ''
+GROUP BY
+	n.vehicle_id, n.trip_id, n.lat, n.lon, n.bearing, n.speed, n.nearest_stop_id, n.nearest_stop_m
+ORDER BY n.vehicle_id
+`
+	rows, err := r.pool.Query(ctx, q, maxVehicles)
+	if err != nil {
+		return nil, fmt.Errorf("unassigned vehicle hints: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.UnassignedVehicleHint, 0, maxVehicles)
+	for rows.Next() {
+		var (
+			h         models.UnassignedVehicleHint
+			bear, spd sql.NullFloat64
+			routesCSV string
+		)
+		if err = rows.Scan(
+			&h.VehicleID, &h.TripID, &h.Lat, &h.Lon, &bear, &spd,
+			&h.NearestStopID, &h.NearestStopDistanceM, &routesCSV,
+		); err != nil {
+			return nil, fmt.Errorf("scan unassigned hint: %w", err)
+		}
+		if bear.Valid {
+			f := bear.Float64
+			h.Bearing = &f
+		}
+		if spd.Valid {
+			f := spd.Float64
+			h.Speed = &f
+		}
+		h.PossibleRouteIDs = splitRouteCSV(routesCSV, maxPossibleRoutesPerHint)
+		r.attachShapeProximityRanking(ctx, &h)
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
+const (
+	maxRoutesToRankPerHint = 6
+	bestRouteMaxDistM      = 500.0
+	bestRouteSecondGapM    = 20.0
+)
+
+// attachShapeProximityRanking fills ranked_routes and optionally best_route_id using min distance
+// from the vehicle point to each candidate route’s dominant GTFS shape (vertex sampling). Best is
+// only set when the closest line is within bestRouteMaxDistM and clearly nearer than the runner-up.
+func (r *Repository) attachShapeProximityRanking(ctx context.Context, h *models.UnassignedVehicleHint) {
+	ids := h.PossibleRouteIDs
+	if len(ids) == 0 {
+		return
+	}
+	toRank := ids
+	if len(toRank) > maxRoutesToRankPerHint {
+		toRank = ids[:maxRoutesToRankPerHint]
+	}
+	ranked, err := r.rankRoutesByShapeProximity(ctx, h.Lon, h.Lat, toRank)
+	if err != nil {
+		return
+	}
+	h.RankedRoutes = ranked
+	if len(ids) == 1 {
+		h.BestRouteID = ids[0]
+		return
+	}
+	if len(ranked) == 0 {
+		return
+	}
+	first := ranked[0]
+	if first.DistanceM > bestRouteMaxDistM {
+		return
+	}
+	if len(ranked) == 1 {
+		h.BestRouteID = first.RouteID
+		return
+	}
+	if ranked[1].DistanceM-first.DistanceM >= bestRouteSecondGapM {
+		h.BestRouteID = first.RouteID
+	}
+}
+
+func (r *Repository) rankRoutesByShapeProximity(ctx context.Context, lon, lat float64, routeIDs []string) ([]models.RouteProximityRank, error) {
+	if len(routeIDs) == 0 {
+		return nil, nil
+	}
+	const q = `
+SELECT u.route_id,
+	COALESCE(MIN(
+		ST_Distance(
+			ST_SetSRID(ST_MakePoint($1::float8, $2::float8), 4326)::geography,
+			ST_SetSRID(ST_MakePoint(sh.shape_pt_lon, sh.shape_pt_lat), 4326)::geography
+		)
+	), 1e15)::float8 AS dist_m
+FROM unnest($3::text[]) AS u(route_id)
+LEFT JOIN LATERAL (
+	SELECT sh.shape_pt_lon, sh.shape_pt_lat
+	FROM shapes sh
+	INNER JOIN (
+		SELECT t.shape_id
+		FROM trips t
+		WHERE t.route_id = u.route_id
+		  AND t.shape_id IS NOT NULL
+		  AND TRIM(COALESCE(t.shape_id::text, '')) <> ''
+		GROUP BY t.shape_id
+		ORDER BY COUNT(*) DESC
+		LIMIT 1
+	) rep ON rep.shape_id = sh.shape_id
+	WHERE sh.shape_pt_lat IS NOT NULL AND sh.shape_pt_lon IS NOT NULL
+) sh ON true
+GROUP BY u.route_id
+ORDER BY dist_m ASC
+`
+	rows, err := r.pool.Query(ctx, q, lon, lat, routeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("rank routes by shape proximity: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.RouteProximityRank, 0, len(routeIDs))
+	for rows.Next() {
+		var rr models.RouteProximityRank
+		if err = rows.Scan(&rr.RouteID, &rr.DistanceM); err != nil {
+			return nil, fmt.Errorf("scan route proximity: %w", err)
+		}
+		out = append(out, rr)
+	}
+	return out, rows.Err()
+}
+
+func splitRouteCSV(csv string, max int) []string {
+	if strings.TrimSpace(csv) == "" {
+		return nil
+	}
+	parts := strings.Split(csv, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		out = append(out, p)
+		if len(out) >= max {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+

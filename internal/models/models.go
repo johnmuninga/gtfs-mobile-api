@@ -52,9 +52,36 @@ type RouteLiveVehicleCount struct {
 // RoutesWithLiveVehiclesPayload is GET /v1/map/routes-with-live-vehicles.
 // Routes lists only route_id values with count ≥ 1; merge with static route catalog on the client for zeros.
 type RoutesWithLiveVehiclesPayload struct {
-	Routes                   []RouteLiveVehicleCount `json:"routes"`
-	UnassignedVehicleCount   int                     `json:"unassigned_vehicle_count"`
-	TotalVehicles            int                     `json:"total_vehicles"`
+	Routes                 []RouteLiveVehicleCount  `json:"routes"`
+	UnassignedVehicleCount int                      `json:"unassigned_vehicle_count"`
+	TotalVehicles            int                      `json:"total_vehicles"`
+	// UnassignedHints is set only when includeUnassignedHints=1: location + heuristic candidate routes (nearest stop).
+	UnassignedHints []UnassignedVehicleHint `json:"unassigned_hints,omitempty"`
+}
+
+// RouteProximityRank orders candidate routes by min distance (m) from the vehicle point to the route’s
+// representative GTFS shape polyline (vertex sampling). Lower is closer to that line on the map.
+type RouteProximityRank struct {
+	RouteID   string  `json:"route_id"`
+	DistanceM float64 `json:"distance_m"`
+}
+
+// UnassignedVehicleHint is a vehicle with no canonical route_id, plus optional geographic hints.
+// PossibleRouteIDs are routes that serve the nearest stop — not proof the vehicle is on that line.
+// RankedRoutes / BestRouteID disambiguate when several routes share that stop, using distance-to-shape (heuristic).
+type UnassignedVehicleHint struct {
+	VehicleID            string               `json:"vehicle_id"`
+	TripID               string               `json:"trip_id,omitempty"`
+	Lat                  float64              `json:"lat"`
+	Lon                  float64              `json:"lon"`
+	Bearing              *float64             `json:"bearing,omitempty"`
+	Speed                *float64             `json:"speed,omitempty"`
+	NearestStopID        string               `json:"nearest_stop_id,omitempty"`
+	NearestStopDistanceM float64              `json:"nearest_stop_distance_m,omitempty"`
+	PossibleRouteIDs     []string             `json:"possible_route_ids,omitempty"`
+	RankedRoutes         []RouteProximityRank `json:"ranked_routes,omitempty"`
+	// BestRouteID is set when a single candidate exists, or when the closest shape is clearly nearer than the rest (heuristic).
+	BestRouteID string `json:"best_route_id,omitempty"`
 }
 
 type StopSummary struct {

@@ -1256,16 +1256,23 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRoutesWithLiveVehicles(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
-	defer cancel()
-
-	const cacheKey = "routes_with_live_vehicles"
+	q := r.URL.Query()
+	wantHints := strings.EqualFold(q.Get("includeUnassignedHints"), "true") || q.Get("includeUnassignedHints") == "1"
+	maxHints := clamp(parseIntOr(q.Get("maxUnassignedHints"), 80), 1, 150)
+	cacheKey := "routes_with_live_vehicles:hints=" + strconv.FormatBool(wantHints) + ":n=" + strconv.Itoa(maxHints)
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		if hit, ok := cached.(models.ResponseEnvelope); ok {
 			writeJSON(w, http.StatusOK, hit)
 			return
 		}
 	}
+
+	ctxDur := requestTimeout
+	if wantHints {
+		ctxDur = mapOverlayTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), ctxDur)
+	defer cancel()
 
 	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
 	if err != nil {
@@ -1278,6 +1285,16 @@ func (s *Server) handleRoutesWithLiveVehicles(w http.ResponseWriter, r *http.Req
 		log.Printf("routes with live vehicles: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to aggregate live vehicles by route")
 		return
+	}
+
+	if wantHints {
+		hints, errH := s.repo.GetUnassignedVehicleHints(ctx, maxHints)
+		if errH != nil {
+			log.Printf("unassigned vehicle hints: %v", errH)
+			httpError(w, http.StatusInternalServerError, "failed to build unassigned vehicle hints")
+			return
+		}
+		payload.UnassignedHints = hints
 	}
 
 	resp := models.ResponseEnvelope{
