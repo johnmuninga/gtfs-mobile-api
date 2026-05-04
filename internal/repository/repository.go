@@ -1182,12 +1182,24 @@ WHERE user_id = $1::uuid AND route_id = $2
 // ============================================================================
 
 func (r *Repository) GetVehicles(ctx context.Context) ([]models.Vehicle, error) {
+	// Prefer route_id from the realtime row; if missing, resolve from static trips via trip_id
+	// so the app can always show which line the vehicle is on when trip_id matches GTFS.
 	const q = `
-SELECT vehicle_id, COALESCE(trip_id,''), COALESCE(route_id,''),
-	COALESCE(latitude,0), COALESCE(longitude,0),
-	bearing, speed
-FROM vehicle_positions_current
-WHERE latitude IS NOT NULL AND longitude IS NOT NULL
+SELECT
+	v.vehicle_id,
+	COALESCE(v.trip_id, ''),
+	COALESCE(
+		NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+		NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+		''
+	),
+	COALESCE(v.latitude, 0),
+	COALESCE(v.longitude, 0),
+	v.bearing,
+	v.speed
+FROM vehicle_positions_current v
+LEFT JOIN trips t ON t.trip_id = v.trip_id
+WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
 `
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {

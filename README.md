@@ -20,7 +20,7 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 
 ## Endpoints
 
-- `GET /v1/map/vehicles` - active vehicles from `vehicle_positions_current`
+- `GET /v1/map/vehicles` - active vehicles from `vehicle_positions_current`; `route_id` uses the realtime row when set, otherwise is filled from static `trips` using `trip_id` when that trip exists in GTFS
 - `GET /v1/realtime/trip-updates?limit=500` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); `data` is a JSON array matching your DB columns
 - `GET /v1/realtime/alerts?limit=500` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); `data` is a JSON array matching your DB columns
 - `GET /v1/routes` - route list from `routes`
