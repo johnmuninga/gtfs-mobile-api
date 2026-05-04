@@ -671,12 +671,27 @@ paths:
     get:
       tags: [Realtime]
       summary: Active vehicle positions
+      description: |
+        Each vehicle includes canonical `route_id` (static `routes.route_id`), resolved from the realtime row or from `trips` via `trip_id`, plus `route_short_name` / `route_long_name` from `routes` when the route exists.
       responses:
         "200":
           description: OK
           content:
             application/json:
               schema: { $ref: "#/components/schemas/VehiclesResponse" }
+
+  /v1/map/routes-with-live-vehicles:
+    get:
+      tags: [Realtime]
+      summary: Live vehicle counts per canonical route_id
+      description: |
+        For route pickers: merge this with `GET /v1/gtfs/routes` or map static routes. `data.routes` lists only routes with at least one vehicle; `unassigned_vehicle_count` is positions that could not be tied to a GTFS route_id.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RoutesWithLiveVehiclesResponse" }
 
   /v1/realtime/trip-updates:
     get:
@@ -858,11 +873,37 @@ components:
       properties:
         vehicle_id: { type: string }
         trip_id: { type: string }
-        route_id: { type: string }
+        route_id: { type: string, description: Canonical GTFS routes.route_id when resolvable }
+        route_short_name: { type: string, description: From static routes; display / fallback }
+        route_long_name: { type: string }
         lat: { type: number }
         lon: { type: number }
         bearing: { type: number }
         speed: { type: number }
+
+    RouteLiveVehicleCount:
+      type: object
+      required: [route_id, live_vehicle_count]
+      properties:
+        route_id: { type: string }
+        live_vehicle_count: { type: integer, minimum: 1 }
+
+    RoutesWithLiveVehiclesPayload:
+      type: object
+      required: [routes, unassigned_vehicle_count, total_vehicles]
+      properties:
+        routes:
+          type: array
+          items: { $ref: "#/components/schemas/RouteLiveVehicleCount" }
+        unassigned_vehicle_count: { type: integer, minimum: 0 }
+        total_vehicles: { type: integer, minimum: 0 }
+
+    RoutesWithLiveVehiclesResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/RoutesWithLiveVehiclesPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
 
     ServiceCalendarDay:
       type: object

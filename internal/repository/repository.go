@@ -1182,24 +1182,36 @@ WHERE user_id = $1::uuid AND route_id = $2
 // ============================================================================
 
 func (r *Repository) GetVehicles(ctx context.Context) ([]models.Vehicle, error) {
-	// Prefer route_id from the realtime row; if missing, resolve from static trips via trip_id
-	// so the app can always show which line the vehicle is on when trip_id matches GTFS.
+	// Canonical route_id: realtime row first, else trips.route_id; names from routes table.
 	const q = `
 SELECT
-	v.vehicle_id,
-	COALESCE(v.trip_id, ''),
-	COALESCE(
-		NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
-		NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
-		''
-	),
-	COALESCE(v.latitude, 0),
-	COALESCE(v.longitude, 0),
-	v.bearing,
-	v.speed
-FROM vehicle_positions_current v
-LEFT JOIN trips t ON t.trip_id = v.trip_id
-WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
+	x.vehicle_id,
+	x.trip_id,
+	x.route_id,
+	COALESCE(NULLIF(TRIM(r.route_short_name), ''), ''),
+	COALESCE(NULLIF(TRIM(r.route_long_name), ''), ''),
+	x.lat,
+	x.lon,
+	x.bearing,
+	x.speed
+FROM (
+	SELECT
+		v.vehicle_id,
+		COALESCE(v.trip_id, '') AS trip_id,
+		COALESCE(
+			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+			''
+		) AS route_id,
+		COALESCE(v.latitude, 0) AS lat,
+		COALESCE(v.longitude, 0) AS lon,
+		v.bearing,
+		v.speed
+	FROM vehicle_positions_current v
+	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
+) x
+LEFT JOIN routes r ON r.route_id = x.route_id AND x.route_id <> ''
 `
 	rows, err := r.pool.Query(ctx, q)
 	if err != nil {
@@ -1210,10 +1222,65 @@ WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
 	out := make([]models.Vehicle, 0, 64)
 	for rows.Next() {
 		var v models.Vehicle
-		if err = rows.Scan(&v.VehicleID, &v.TripID, &v.RouteID, &v.Lat, &v.Lon, &v.Bearing, &v.Speed); err != nil {
+		if err = rows.Scan(&v.VehicleID, &v.TripID, &v.RouteID, &v.ShortName, &v.LongName, &v.Lat, &v.Lon, &v.Bearing, &v.Speed); err != nil {
 			return nil, fmt.Errorf("scan vehicle: %w", err)
 		}
 		out = append(out, v)
+	}
+	return out, rows.Err()
+}
+
+// GetRoutesWithLiveVehicleCounts returns per-route vehicle counts (canonical routes.route_id only)
+// and how many vehicles could not be tied to any route. Routes slice omits zero counts.
+func (r *Repository) GetRoutesWithLiveVehicleCounts(ctx context.Context) (models.RoutesWithLiveVehiclesPayload, error) {
+	const base = `
+WITH resolved AS (
+	SELECT
+		v.vehicle_id,
+		COALESCE(
+			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+			''
+		) AS route_id
+	FROM vehicle_positions_current v
+	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
+)
+`
+	var out models.RoutesWithLiveVehiclesPayload
+
+	var total int
+	if err := r.pool.QueryRow(ctx, base+`SELECT COUNT(*)::int FROM resolved`).Scan(&total); err != nil {
+		return out, fmt.Errorf("count live vehicles: %w", err)
+	}
+	out.TotalVehicles = total
+
+	if err := r.pool.QueryRow(ctx, base+`SELECT COUNT(*)::int FROM resolved WHERE route_id = ''`).Scan(&out.UnassignedVehicleCount); err != nil {
+		return out, fmt.Errorf("count unassigned vehicles: %w", err)
+	}
+
+	qAgg := base + `
+SELECT route_id, COUNT(*)::int
+FROM resolved
+WHERE route_id <> ''
+GROUP BY route_id
+ORDER BY route_id
+`
+	rows, err := r.pool.Query(ctx, qAgg)
+	if err != nil {
+		return out, fmt.Errorf("aggregate vehicles by route: %w", err)
+	}
+	defer rows.Close()
+
+	out.Routes = make([]models.RouteLiveVehicleCount, 0, 64)
+	for rows.Next() {
+		var row models.RouteLiveVehicleCount
+		if err = rows.Scan(&row.RouteID, &row.LiveVehicleCount); err != nil {
+			return out, fmt.Errorf("scan route live count: %w", err)
+		}
+		if row.LiveVehicleCount > 0 {
+			out.Routes = append(out.Routes, row)
+		}
 	}
 	return out, rows.Err()
 }

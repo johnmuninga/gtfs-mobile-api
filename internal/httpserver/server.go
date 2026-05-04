@@ -125,6 +125,7 @@ func (s *Server) Router() http.Handler {
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
+	mux.HandleFunc("GET /v1/map/routes-with-live-vehicles", s.handleRoutesWithLiveVehicles)
 	mux.Handle("GET /v1/realtime/trip-updates", dynamicCache(http.HandlerFunc(s.handleRealtimeTripUpdates)))
 	mux.Handle("GET /v1/realtime/alerts", dynamicCache(http.HandlerFunc(s.handleRealtimeAlerts)))
 
@@ -1251,6 +1252,40 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 		Meta:   &models.Meta{Total: len(vehicles)},
 	}
 	s.cache.SetWithTTL(vehiclesCacheKey, resp, vehiclesCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleRoutesWithLiveVehicles(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	const cacheKey = "routes_with_live_vehicles"
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if hit, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, hit)
+			return
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	payload, err := s.repo.GetRoutesWithLiveVehicleCounts(ctx)
+	if err != nil {
+		log.Printf("routes with live vehicles: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to aggregate live vehicles by route")
+		return
+	}
+
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   &models.Meta{Total: len(payload.Routes)},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, vehiclesCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
 }
 

@@ -33,11 +33,28 @@ type Meta struct {
 type Vehicle struct {
 	VehicleID string   `json:"vehicle_id"`
 	TripID    string   `json:"trip_id,omitempty"`
+	// RouteID is always canonical GTFS routes.route_id when resolvable (vehicle row, else trips.route_id).
 	RouteID   string   `json:"route_id,omitempty"`
+	ShortName string   `json:"route_short_name,omitempty"` // from routes; display / fallback join
+	LongName  string   `json:"route_long_name,omitempty"`
 	Lat       float64  `json:"lat"`
 	Lon       float64  `json:"lon"`
 	Bearing   *float64 `json:"bearing,omitempty"`
 	Speed     *float64 `json:"speed,omitempty"`
+}
+
+// RouteLiveVehicleCount is one route that currently has at least one vehicle in the feed.
+type RouteLiveVehicleCount struct {
+	RouteID          string `json:"route_id"`
+	LiveVehicleCount int    `json:"live_vehicle_count"`
+}
+
+// RoutesWithLiveVehiclesPayload is GET /v1/map/routes-with-live-vehicles.
+// Routes lists only route_id values with count ≥ 1; merge with static route catalog on the client for zeros.
+type RoutesWithLiveVehiclesPayload struct {
+	Routes                   []RouteLiveVehicleCount `json:"routes"`
+	UnassignedVehicleCount   int                     `json:"unassigned_vehicle_count"`
+	TotalVehicles            int                     `json:"total_vehicles"`
 }
 
 type StopSummary struct {
