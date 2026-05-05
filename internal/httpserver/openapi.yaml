@@ -414,6 +414,35 @@ paths:
         "404":
           description: Not found
 
+  /v1/gtfs/routes/{routeId}/shape-encoded:
+    get:
+      tags: [Routes]
+      summary: Encoded polyline for most common route shape
+      description: |
+        Same representative shape selection as `/v1/gtfs/routes/{routeId}/shape`, but geometry is returned
+        as a Google encoded polyline string to reduce payload size for mobile map rendering.
+      parameters:
+        - in: path
+          name: routeId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: directionId
+          schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: maxPoints
+          description: |
+            Max vertices sampled before encoding (50–25000). Defaults to 2000. Use 0 for no cap.
+          schema: { type: integer, minimum: 0, maximum: 25000 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RouteShapeEncodedResponse" }
+        "404":
+          description: Not found
+
   /v1/gtfs/trips:
     get:
       tags: [Trips]
@@ -615,6 +644,86 @@ paths:
         "400":
           description: Missing or invalid routeIds
 
+  /v1/map/routes-normalized:
+    get:
+      tags: [Map]
+      summary: Normalized map payload (ID-indexed entities + encoded geometry)
+      description: |
+        Mobile-optimized relational payload to avoid deep nested iteration in React Native.
+        Returns:
+        - `routes`: dictionary keyed by `route_id`
+        - `stops`: dictionary keyed by `stop_id`
+        - `junctions`: `route_id -> ordered stop_id[]`
+        - `route_geometries`: `route_id -> encoded polyline` (compact geometry string)
+      parameters:
+        - in: query
+          name: routeIds
+          required: true
+          description: Comma-separated `route_id` values (max 25)
+          schema: { type: string, example: "M6,M61,M62" }
+        - in: query
+          name: directionId
+          description: If set (`0` or `1`), only that direction is included per route
+          schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: maxPoints
+          description: Vertex cap per shape before encoding (default 1800). Use 0 for full GTFS resolution.
+          schema: { type: integer, minimum: 0, maximum: 25000 }
+        - in: query
+          name: routeIdsKind
+          description: |
+            Omit or `route_id` — each token is a GTFS `route_id`.
+            `short_name` — tokens are `route_short_name`; backend resolves to `route_id`.
+          schema: { type: string, enum: [route_id, short_name, short] }
+      responses:
+        "200":
+          description: |
+            OK. `meta.missing_route_ids` lists tokens or route_ids with no drawable geometry.
+            `meta.requested_routes` is how many distinct routes were requested after resolution.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MapNormalizedResponse" }
+        "400":
+          description: Missing or invalid routeIds
+
+  /v1/map/arrivals-normalized:
+    get:
+      tags: [Map]
+      summary: Normalized arrivals by stop_id (flat, pre-sorted rows)
+      description: |
+        Returns `arrivals` as a dictionary keyed by `stop_id`, where each array is pre-sorted by time.
+        Use `cursor` + `limit` for chunked loading on mobile without large payload spikes.
+      parameters:
+        - in: query
+          name: stopIds
+          required: true
+          description: Comma-separated `stop_id` values (max 250)
+          schema: { type: string }
+        - in: query
+          name: at
+          description: ISO 8601 timestamp (defaults to now)
+          schema: { type: string, format: date-time }
+        - in: query
+          name: windowMinutes
+          description: Minutes ahead to include (default 180, max 360)
+          schema: { type: integer, minimum: 1, maximum: 360, default: 180 }
+        - in: query
+          name: limit
+          description: Max flattened rows per page (default 500, max 2000)
+          schema: { type: integer, minimum: 1, maximum: 2000, default: 500 }
+        - in: query
+          name: cursor
+          description: Opaque cursor from previous response `meta.next_cursor`.
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArrivalsNormalizedResponse" }
+        "400":
+          description: Missing or invalid stopIds/cursor/at
+
   /v1/map/static:
     get:
       tags: [Map]
@@ -673,6 +782,13 @@ paths:
       summary: Active vehicle positions
       description: |
         Each vehicle includes canonical `route_id` (static `routes.route_id`), resolved from the realtime row or from `trips` via `trip_id`, plus `route_short_name` / `route_long_name` from `routes` when the route exists.
+
+        By default (`inferRoute` omitted or true), vehicles the feed left unassigned get `route_id` filled from nearest-stop + shape-distance heuristics (same family as `unassigned_hints`); `route_inferred: true` marks those rows. Send `inferRoute=0` or `false` to skip that pass (faster).
+      parameters:
+        - in: query
+          name: inferRoute
+          description: When false or 0, do not infer route_id for unassigned vehicles (default is infer on).
+          schema: { type: string, enum: ["0", "1", "true", "false"] }
       responses:
         "200":
           description: OK
@@ -687,7 +803,7 @@ paths:
       description: |
         For route pickers: merge this with `GET /v1/gtfs/routes` or map static routes. `data.routes` lists only routes with at least one vehicle; `unassigned_vehicle_count` is positions that could not be tied to a GTFS route_id.
 
-        Set `includeUnassignedHints=1` to add `data.unassigned_hints`: each unassigned vehicle’s lat/lon plus **heuristic** `possible_route_ids` from the nearest stop (not guaranteed to be the vehicle’s line). When several routes share that stop, `ranked_routes` orders candidates by min distance (m) to each route’s dominant GTFS shape; `best_route_id` is set only when that geometry signal is confident (single candidate, or closest within 500 m and ≥20 m ahead of the next).
+        Set `includeUnassignedHints=1` to add `data.unassigned_hints`: each unassigned vehicle’s lat/lon plus **heuristic** `possible_route_ids` from the nearest stop (not guaranteed to be the vehicle’s line). When several routes share that stop, `ranked_routes` orders candidates by min distance (m) to each route’s dominant GTFS shape; `best_route_id` uses geometry thresholds and may fall back to the closest shape within ~900 m when gaps are ambiguous.
       parameters:
         - in: query
           name: includeUnassignedHints
@@ -716,6 +832,10 @@ paths:
           name: limit
           description: Max rows (default 500, max 2000)
           schema: { type: integer, minimum: 1, maximum: 2000, default: 500 }
+        - in: query
+          name: cursor
+          description: Opaque cursor from previous response `meta.next_cursor`.
+          schema: { type: string }
       responses:
         "200":
           description: OK
@@ -735,6 +855,10 @@ paths:
           name: limit
           description: Max rows (default 500, max 2000)
           schema: { type: integer, minimum: 1, maximum: 2000, default: 500 }
+        - in: query
+          name: cursor
+          description: Opaque cursor from previous response `meta.next_cursor`.
+          schema: { type: string }
       responses:
         "200":
           description: OK
@@ -763,6 +887,7 @@ components:
         limit: { type: integer }
         page: { type: integer }
         has_next: { type: boolean }
+        next_cursor: { type: string }
         service_date: { type: string }
         requested_routes: { type: integer }
         missing_route_ids:
@@ -830,6 +955,19 @@ components:
           type: array
           items: { $ref: "#/components/schemas/RouteShapePoint" }
 
+    RouteShapeEncoded:
+      type: object
+      required: [route_id, shape_id, encoded_polyline]
+      properties:
+        route_id: { type: string }
+        shape_id: { type: string }
+        encoded_polyline:
+          type: string
+          description: Google encoded polyline string.
+        total_points:
+          type: integer
+          description: Full vertex count for this shape_id in the database (before maxPoints sampling).
+
     RouteDirection:
       type: object
       required: [direction_id, trip_count]
@@ -884,9 +1022,12 @@ components:
       properties:
         vehicle_id: { type: string }
         trip_id: { type: string }
-        route_id: { type: string, description: Canonical GTFS routes.route_id when resolvable }
+        route_id: { type: string, description: Canonical GTFS routes.route_id when resolvable or inferred for map display }
         route_short_name: { type: string, description: From static routes; display / fallback }
         route_long_name: { type: string }
+        route_inferred:
+          type: boolean
+          description: True when route_id was guessed from stop/shape heuristics because the feed omitted route.
         lat: { type: number }
         lon: { type: number }
         bearing: { type: number }
@@ -1153,6 +1294,13 @@ components:
         data: { $ref: "#/components/schemas/RouteShape" }
         meta: { $ref: "#/components/schemas/Meta" }
 
+    RouteShapeEncodedResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/RouteShapeEncoded" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
     RouteDirectionsResponse:
       type: object
       properties:
@@ -1311,6 +1459,66 @@ components:
       properties:
         status: { $ref: "#/components/schemas/APIStatus" }
         data: { $ref: "#/components/schemas/MapRoutesOverlayPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    MapNormalizedPayload:
+      type: object
+      required: [routes, stops, junctions, route_geometries]
+      properties:
+        routes:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/RouteMapLite" }
+          description: Dictionary keyed by route_id.
+        stops:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/StopSummary" }
+          description: Dictionary keyed by stop_id.
+        junctions:
+          type: object
+          additionalProperties:
+            type: array
+            items: { type: string }
+          description: route_id -> ordered stop_id[] for that route.
+        route_geometries:
+          type: object
+          additionalProperties: { type: string }
+          description: route_id -> encoded polyline.
+
+    MapNormalizedResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/MapNormalizedPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    StopArrivalLite:
+      type: object
+      required: [trip_id, scheduled_time, estimated_time, is_realtime]
+      properties:
+        trip_id: { type: string }
+        route_id: { type: string }
+        route_short_name: { type: string }
+        headsign: { type: string }
+        scheduled_time: { type: string, format: date-time }
+        estimated_time: { type: string, format: date-time }
+        is_realtime: { type: boolean }
+
+    ArrivalsNormalizedPayload:
+      type: object
+      required: [arrivals]
+      properties:
+        arrivals:
+          type: object
+          description: Dictionary keyed by stop_id.
+          additionalProperties:
+            type: array
+            items: { $ref: "#/components/schemas/StopArrivalLite" }
+
+    ArrivalsNormalizedResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/ArrivalsNormalizedPayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     VehiclesResponse:

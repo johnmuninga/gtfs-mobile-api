@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -26,23 +28,23 @@ import (
 )
 
 const (
-	defaultStopsLimit  = 50
-	maxStopsLimit      = 200
-	defaultRoutesLimit = 200
-	maxRoutesLimit     = 500
-	defaultTripsLimit  = 200
-	maxTripsLimit      = 1000
-	defaultDepartures  = 20
-	maxDepartures      = 50
-	defaultWindowMins  = 60
-	maxWindowMins      = 360
-	defaultShapePoints = 2000 // cap returned vertices; full table may be 400k+ rows across all shapes
-	minShapePoints     = 50
-	maxShapePoints     = 25000
-	defaultMapStops    = 150
-	maxMapStops        = 500
-	defaultMapRoutes   = 300
-	maxMapRoutes       = 500
+	defaultStopsLimit         = 50
+	maxStopsLimit             = 200
+	defaultRoutesLimit        = 200
+	maxRoutesLimit            = 500
+	defaultTripsLimit         = 200
+	maxTripsLimit             = 1000
+	defaultDepartures         = 20
+	maxDepartures             = 50
+	defaultWindowMins         = 60
+	maxWindowMins             = 360
+	defaultShapePoints        = 2000 // cap returned vertices; full table may be 400k+ rows across all shapes
+	minShapePoints            = 50
+	maxShapePoints            = 25000
+	defaultMapStops           = 150
+	maxMapStops               = 500
+	defaultMapRoutes          = 300
+	maxMapRoutes              = 500
 	defaultOverlayShapePoints = 1800
 	maxOverlayRoutes          = 25
 	defaultCalendarLimit      = 100
@@ -105,6 +107,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/gtfs/routes/{routeId}/directions", staticCache(http.HandlerFunc(s.handleRouteDirections)))
 	mux.Handle("GET /v1/gtfs/routes/{routeId}/stops", staticCache(http.HandlerFunc(s.handleRouteStops)))
 	mux.Handle("GET /v1/gtfs/routes/{routeId}/shape", staticCache(http.HandlerFunc(s.handleRouteShape)))
+	mux.Handle("GET /v1/gtfs/routes/{routeId}/shape-encoded", staticCache(http.HandlerFunc(s.handleRouteShapeEncoded)))
 
 	mux.Handle("GET /v1/gtfs/trips", staticCache(http.HandlerFunc(s.handleListTrips)))
 	mux.Handle("GET /v1/gtfs/trips/{tripId}", staticCache(http.HandlerFunc(s.handleGetTrip)))
@@ -122,6 +125,10 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/map/static", staticCache(http.HandlerFunc(s.handleMapStatic)))
 	// Map: colored polylines + stops per route/direction (for “map explorer” overlays)
 	mux.Handle("GET /v1/map/routes-overlay", staticCache(http.HandlerFunc(s.handleMapRoutesOverlay)))
+	// Map: normalized dictionaries for high-volume RN rendering
+	mux.Handle("GET /v1/map/routes-normalized", staticCache(http.HandlerFunc(s.handleMapRoutesNormalized)))
+	// Map: normalized stop_id -> arrivals[] for flat list rendering
+	mux.Handle("GET /v1/map/arrivals-normalized", dynamicCache(http.HandlerFunc(s.handleArrivalsNormalized)))
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
@@ -463,6 +470,257 @@ func (s *Server) handleMapRoutesOverlay(w http.ResponseWriter, r *http.Request) 
 		Data:   payload,
 		Meta:   meta,
 	})
+}
+
+// handleMapRoutesNormalized returns route/stops dictionaries plus junctions and encoded polylines.
+// This avoids deep nested arrays on clients and enables O(1) lookups in React Native.
+func (s *Server) handleMapRoutesNormalized(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), mapOverlayTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("routeIds"))
+	multi := q["routeIds"]
+	var parts []string
+	if len(multi) > 1 {
+		parts = multi
+	} else if raw != "" {
+		parts = strings.Split(raw, ",")
+	}
+	if len(parts) == 0 {
+		httpError(w, http.StatusBadRequest, "routeIds is required (comma-separated or repeated query values)")
+		return
+	}
+
+	routeIdsKind := strings.ToLower(strings.TrimSpace(q.Get("routeIdsKind")))
+	byShortName := routeIdsKind == "short_name" || routeIdsKind == "short"
+
+	seen := make(map[string]struct{}, len(parts))
+	ids := make([]string, 0, len(parts))
+	var missing []string
+	for _, p := range parts {
+		token := strings.TrimSpace(p)
+		if token == "" {
+			continue
+		}
+		id := token
+		if byShortName {
+			rid, err := s.repo.LookupRouteIDByShortName(ctx, token)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					missing = append(missing, token)
+				} else {
+					log.Printf("map normalized resolve short_name %q: %v", token, err)
+					missing = append(missing, token)
+				}
+				continue
+			}
+			id = rid
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+		if len(ids) >= maxOverlayRoutes {
+			break
+		}
+	}
+	if len(ids) == 0 {
+		httpError(w, http.StatusBadRequest, "no valid route ids after resolving (check route_id or use routeIdsKind=short_name)")
+		return
+	}
+
+	onlyDir := strings.TrimSpace(q.Get("directionId"))
+	maxPts := defaultOverlayShapePoints
+	if rawMP := q.Get("maxPoints"); rawMP != "" {
+		v, err := strconv.Atoi(rawMP)
+		if err != nil || v < 0 || v > maxShapePoints {
+			httpError(w, http.StatusBadRequest, "invalid maxPoints (0 for full resolution, or 50–25000)")
+			return
+		}
+		if v > 0 {
+			maxPts = clamp(v, minShapePoints, maxShapePoints)
+		} else {
+			maxPts = 0
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	cacheKey := "map_normalized:" + strings.Join(ids, ",") + "|" + onlyDir + "|" + strconv.Itoa(maxPts) + "|" + string(status.Mode)
+	payload := models.MapNormalizedPayload{
+		Routes:          map[string]models.RouteMapLite{},
+		Stops:           map[string]models.StopSummary{},
+		Junctions:       map[string][]string{},
+		RouteGeometries: map[string]string{},
+	}
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if hit, ok := cached.(struct {
+			Payload models.MapNormalizedPayload
+			Missing []string
+		}); ok {
+			payload = hit.Payload
+			missing = append(missing, hit.Missing...)
+		}
+	}
+	if len(payload.Routes) == 0 && len(payload.Stops) == 0 && len(payload.RouteGeometries) == 0 {
+		for _, routeID := range ids {
+			geo, err := s.repo.GetMapRouteWithGeometry(ctx, routeID, maxPts, onlyDir)
+			if err != nil {
+				if errors.Is(err, pgx.ErrNoRows) {
+					missing = append(missing, routeID)
+					continue
+				}
+				log.Printf("map routes normalized %s: %v", routeID, err)
+				missing = append(missing, routeID)
+				continue
+			}
+			payload.Routes[geo.RouteID] = models.RouteMapLite{
+				RouteID:        geo.RouteID,
+				ShortName:      geo.ShortName,
+				LongName:       geo.LongName,
+				RouteColor:     geo.RouteColor,
+				RouteTextColor: geo.RouteTextColor,
+			}
+			stopIDs := make([]string, 0, 64)
+			seenStop := map[string]struct{}{}
+			for _, leg := range geo.Legs {
+				for _, st := range leg.Stops {
+					id := strings.TrimSpace(st.StopID)
+					if id == "" {
+						continue
+					}
+					if _, ok := seenStop[id]; ok {
+						continue
+					}
+					seenStop[id] = struct{}{}
+					stopIDs = append(stopIDs, id)
+					payload.Stops[id] = st
+				}
+			}
+			payload.Junctions[geo.RouteID] = stopIDs
+			if len(geo.Legs) > 0 {
+				// Prefer first leg geometry for route-level fast render; request directionId for strict direction.
+				payload.RouteGeometries[geo.RouteID] = encodePolyline(geo.Legs[0].Points)
+			}
+		}
+		s.cache.SetWithTTL(cacheKey, struct {
+			Payload models.MapNormalizedPayload
+			Missing []string
+		}{Payload: payload, Missing: missing}, mapOverlayCacheTTL)
+	}
+
+	meta := &models.Meta{
+		Total:           len(payload.Routes),
+		RequestedRoutes: len(ids),
+	}
+	if len(missing) > 0 {
+		meta.MissingRouteIds = missing
+	}
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   meta,
+	})
+}
+
+func (s *Server) handleArrivalsNormalized(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("stopIds"))
+	multi := q["stopIds"]
+	var parts []string
+	if len(multi) > 1 {
+		parts = multi
+	} else if raw != "" {
+		parts = strings.Split(raw, ",")
+	}
+	if len(parts) == 0 {
+		httpError(w, http.StatusBadRequest, "stopIds is required (comma-separated or repeated query values)")
+		return
+	}
+	seen := make(map[string]struct{}, len(parts))
+	stopIDs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		id := strings.TrimSpace(p)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		stopIDs = append(stopIDs, id)
+		if len(stopIDs) >= 250 {
+			break
+		}
+	}
+	if len(stopIDs) == 0 {
+		httpError(w, http.StatusBadRequest, "no valid stop ids")
+		return
+	}
+
+	at := time.Now()
+	if rawAt := strings.TrimSpace(q.Get("at")); rawAt != "" {
+		v, err := time.Parse(time.RFC3339, rawAt)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "invalid at (use RFC3339)")
+			return
+		}
+		at = v
+	}
+	window := clamp(parseIntOr(q.Get("windowMinutes"), 180), 1, 360)
+	limit := clamp(parseIntOr(q.Get("limit"), 500), 1, 2000)
+	offset, bad := parseCursorOffset(q.Get("cursor"))
+	if bad {
+		httpError(w, http.StatusBadRequest, "invalid cursor")
+		return
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	cacheKey := "arrivals_normalized:" + strings.Join(stopIDs, ",") + "|" + at.UTC().Format(time.RFC3339) + "|" + strconv.Itoa(window) + "|" + strconv.Itoa(limit) + "|" + strconv.Itoa(offset)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	rowStopIDs, rows, err := s.repo.GetNormalizedArrivals(ctx, stopIDs, at, window, limit, offset)
+	if err != nil {
+		log.Printf("arrivals normalized: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load arrivals")
+		return
+	}
+	payload := models.ArrivalsNormalizedPayload{Arrivals: make(map[string][]models.StopArrivalLite, len(stopIDs))}
+	for i := range rows {
+		sid := rowStopIDs[i]
+		payload.Arrivals[sid] = append(payload.Arrivals[sid], rows[i])
+	}
+
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta: &models.Meta{
+			Total:      len(rows),
+			Limit:      limit,
+			NextCursor: nextCursorForCount(len(rows), offset, limit),
+		},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, realtimeTripCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // ============================================================================
@@ -836,6 +1094,71 @@ func (s *Server) handleRouteShape(w http.ResponseWriter, r *http.Request) {
 		Status: status,
 		Data:   shape,
 		Meta:   &models.Meta{Total: len(shape.Points)},
+	})
+}
+
+func (s *Server) handleRouteShapeEncoded(w http.ResponseWriter, r *http.Request) {
+	routeID := r.PathValue("routeId")
+	if routeID == "" {
+		httpError(w, http.StatusBadRequest, "missing route id")
+		return
+	}
+	directionID := strings.TrimSpace(r.URL.Query().Get("directionId"))
+	q := r.URL.Query()
+	maxPoints := defaultShapePoints
+	if raw := strings.TrimSpace(q.Get("maxPoints")); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v < 0 {
+			httpError(w, http.StatusBadRequest, "invalid maxPoints (use 0 for full resolution, or a positive integer)")
+			return
+		}
+		if v == 0 {
+			maxPoints = 0
+		} else {
+			maxPoints = clamp(v, minShapePoints, maxShapePoints)
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	shapeCacheKey := "route_shape_encoded:" + routeID + "|" + directionID + "|" + strconv.Itoa(maxPoints) + "|" + string(status.Mode)
+	var payload *models.RouteShapeEncoded
+	if cached, ok := s.cache.Get(shapeCacheKey); ok {
+		if hit, ok := cached.(*models.RouteShapeEncoded); ok {
+			payload = hit
+		}
+	}
+	if payload == nil {
+		shape, err := s.repo.GetRouteShape(ctx, routeID, directionID, maxPoints)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpError(w, http.StatusNotFound, "route shape not found")
+			return
+		}
+		if err != nil {
+			log.Printf("route shape encoded: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to fetch route shape")
+			return
+		}
+		payload = &models.RouteShapeEncoded{
+			RouteID:         shape.RouteID,
+			ShapeID:         shape.ShapeID,
+			EncodedPolyline: encodePolyline(shape.Points),
+			TotalPoints:     shape.TotalPoints,
+		}
+		s.cache.SetWithTTL(shapeCacheKey, payload, routeShapeCacheTTL)
+	}
+
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   &models.Meta{Total: payload.TotalPoints},
 	})
 }
 
@@ -1222,16 +1545,22 @@ func (s *Server) handleGetCalendarService(w http.ResponseWriter, r *http.Request
 // ============================================================================
 
 func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
-	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
-	defer cancel()
-
-	const vehiclesCacheKey = "vehicles_payload"
-	if cached, ok := s.cache.Get(vehiclesCacheKey); ok {
+	q := r.URL.Query()
+	inferRoute := !(strings.EqualFold(strings.TrimSpace(q.Get("inferRoute")), "false") || strings.TrimSpace(q.Get("inferRoute")) == "0")
+	cacheKey := "vehicles_payload:infer=" + strconv.FormatBool(inferRoute)
+	if cached, ok := s.cache.Get(cacheKey); ok {
 		if hit, ok := cached.(models.ResponseEnvelope); ok {
 			writeJSON(w, http.StatusOK, hit)
 			return
 		}
 	}
+
+	ctxDur := requestTimeout
+	if inferRoute {
+		ctxDur = mapOverlayTimeout
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), ctxDur)
+	defer cancel()
 
 	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
 	if err != nil {
@@ -1245,13 +1574,20 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "failed to fetch vehicles")
 		return
 	}
+	if inferRoute {
+		if err = s.repo.EnrichVehiclesWithInferredRoutes(ctx, vehicles); err != nil {
+			log.Printf("vehicles infer route: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to infer routes for vehicles")
+			return
+		}
+	}
 
 	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   vehicles,
 		Meta:   &models.Meta{Total: len(vehicles)},
 	}
-	s.cache.SetWithTTL(vehiclesCacheKey, resp, vehiclesCacheTTL)
+	s.cache.SetWithTTL(cacheKey, resp, vehiclesCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -1288,7 +1624,7 @@ func (s *Server) handleRoutesWithLiveVehicles(w http.ResponseWriter, r *http.Req
 	}
 
 	if wantHints {
-		hints, errH := s.repo.GetUnassignedVehicleHints(ctx, maxHints)
+		hints, errH := s.repo.GetUnassignedVehicleHints(ctx, maxHints, nil)
 		if errH != nil {
 			log.Printf("unassigned vehicle hints: %v", errH)
 			httpError(w, http.StatusInternalServerError, "failed to build unassigned vehicle hints")
@@ -1312,9 +1648,14 @@ func (s *Server) handleRealtimeTripUpdates(w http.ResponseWriter, r *http.Reques
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
+	offset, bad := parseCursorOffset(r.URL.Query().Get("cursor"))
+	if bad {
+		httpError(w, http.StatusBadRequest, "invalid cursor")
+		return
+	}
 	limit := clamp(parseIntOr(r.URL.Query().Get("limit"), defaultRealtimeLimit), 1, maxRealtimeLimit)
 	tbl := strings.TrimSpace(s.cfg.RealtimeTripUpdatesTable)
-	cacheKey := "rt_trip_updates:" + tbl + ":" + strconv.Itoa(limit)
+	cacheKey := "rt_trip_updates:" + tbl + ":" + strconv.Itoa(limit) + ":" + strconv.Itoa(offset)
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		if env, ok := cached.(models.ResponseEnvelope); ok {
 			writeJSON(w, http.StatusOK, env)
@@ -1328,7 +1669,7 @@ func (s *Server) handleRealtimeTripUpdates(w http.ResponseWriter, r *http.Reques
 		return
 	}
 
-	raw, err := s.repo.SelectTableAsJSONArray(ctx, tbl, limit)
+	raw, err := s.repo.SelectTableAsJSONArrayCursor(ctx, tbl, limit, offset)
 	if err != nil {
 		log.Printf("realtime trip-updates: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to fetch trip updates")
@@ -1338,7 +1679,7 @@ func (s *Server) handleRealtimeTripUpdates(w http.ResponseWriter, r *http.Reques
 	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   raw,
-		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit},
+		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit, NextCursor: nextCursor(raw, offset, limit)},
 	}
 	s.cache.SetWithTTL(cacheKey, resp, realtimeTripCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
@@ -1349,9 +1690,14 @@ func (s *Server) handleRealtimeAlerts(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
 
+	offset, bad := parseCursorOffset(r.URL.Query().Get("cursor"))
+	if bad {
+		httpError(w, http.StatusBadRequest, "invalid cursor")
+		return
+	}
 	limit := clamp(parseIntOr(r.URL.Query().Get("limit"), defaultRealtimeLimit), 1, maxRealtimeLimit)
 	tbl := strings.TrimSpace(s.cfg.RealtimeAlertsTable)
-	cacheKey := "rt_alerts:" + tbl + ":" + strconv.Itoa(limit)
+	cacheKey := "rt_alerts:" + tbl + ":" + strconv.Itoa(limit) + ":" + strconv.Itoa(offset)
 	if cached, ok := s.cache.Get(cacheKey); ok {
 		if env, ok := cached.(models.ResponseEnvelope); ok {
 			writeJSON(w, http.StatusOK, env)
@@ -1365,7 +1711,7 @@ func (s *Server) handleRealtimeAlerts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	raw, err := s.repo.SelectTableAsJSONArray(ctx, tbl, limit)
+	raw, err := s.repo.SelectTableAsJSONArrayCursor(ctx, tbl, limit, offset)
 	if err != nil {
 		log.Printf("realtime alerts: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to fetch alerts")
@@ -1375,7 +1721,7 @@ func (s *Server) handleRealtimeAlerts(w http.ResponseWriter, r *http.Request) {
 	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   raw,
-		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit},
+		Meta:   &models.Meta{Total: jsonArrayLen(raw), Limit: limit, NextCursor: nextCursor(raw, offset, limit)},
 	}
 	s.cache.SetWithTTL(cacheKey, resp, realtimeAlertsCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
@@ -1387,6 +1733,61 @@ func jsonArrayLen(raw json.RawMessage) int {
 		return 0
 	}
 	return len(arr)
+}
+
+func parseCursorOffset(cursor string) (int, bool) {
+	c := strings.TrimSpace(cursor)
+	if c == "" {
+		return 0, false
+	}
+	decoded, err := base64.RawURLEncoding.DecodeString(c)
+	if err != nil {
+		return 0, true
+	}
+	v, err := strconv.Atoi(strings.TrimSpace(string(decoded)))
+	if err != nil || v < 0 {
+		return 0, true
+	}
+	return v, false
+}
+
+func nextCursor(raw json.RawMessage, offset, limit int) string {
+	return nextCursorForCount(jsonArrayLen(raw), offset, limit)
+}
+
+func nextCursorForCount(count, offset, limit int) string {
+	if count < limit {
+		return ""
+	}
+	return base64.RawURLEncoding.EncodeToString([]byte(strconv.Itoa(offset + limit)))
+}
+
+func encodePolyline(points []models.RouteShapePoint) string {
+	if len(points) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	prevLat, prevLon := 0, 0
+	for _, p := range points {
+		lat := int(math.Round(p.Lat * 1e5))
+		lon := int(math.Round(p.Lon * 1e5))
+		encodeSigned(&b, lat-prevLat)
+		encodeSigned(&b, lon-prevLon)
+		prevLat, prevLon = lat, lon
+	}
+	return b.String()
+}
+
+func encodeSigned(b *strings.Builder, value int) {
+	s := value << 1
+	if value < 0 {
+		s = ^s
+	}
+	for s >= 0x20 {
+		b.WriteByte(byte((0x20 | (s & 0x1f)) + 63))
+		s >>= 5
+	}
+	b.WriteByte(byte(s + 63))
 }
 
 // ============================================================================

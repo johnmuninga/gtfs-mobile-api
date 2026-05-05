@@ -353,6 +353,124 @@ LIMIT $4
 	return out, rows.Err()
 }
 
+// GetNormalizedArrivals returns flattened rows for multiple stops sorted by scheduled_time, then stop_id/trip_id.
+// offset is applied on the flattened stream so the API can paginate with cursor tokens.
+func (r *Repository) GetNormalizedArrivals(ctx context.Context, stopIDs []string, at time.Time, windowMinutes, limit, offset int) ([]string, []models.StopArrivalLite, error) {
+	if len(stopIDs) == 0 {
+		return nil, nil, nil
+	}
+	if limit <= 0 {
+		limit = 250
+	}
+	if limit > 2000 {
+		limit = 2000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	const q = `
+WITH at_ts AS (
+	SELECT $1::timestamptz AS at
+),
+candidate_dates AS (
+	SELECT (at::date) AS d FROM at_ts
+	UNION SELECT (at::date - INTERVAL '1 day')::date FROM at_ts
+),
+active_services AS (
+	SELECT cd.d AS service_date, c.service_id
+	FROM candidate_dates cd
+	JOIN calendar c
+	  ON to_date(c.start_date, 'YYYYMMDD') <= cd.d
+	 AND to_date(c.end_date,   'YYYYMMDD') >= cd.d
+	 AND CASE EXTRACT(ISODOW FROM cd.d)
+			WHEN 1 THEN c.monday
+			WHEN 2 THEN c.tuesday
+			WHEN 3 THEN c.wednesday
+			WHEN 4 THEN c.thursday
+			WHEN 5 THEN c.friday
+			WHEN 6 THEN c.saturday
+			WHEN 7 THEN c.sunday
+		 END = '1'
+	WHERE NOT EXISTS (
+		SELECT 1 FROM calendar_dates ex
+		WHERE ex.service_id = c.service_id
+		  AND ex.date = to_char(cd.d, 'YYYYMMDD')
+		  AND ex.exception_type = '2'
+	)
+	UNION
+	SELECT cd.d AS service_date, ex.service_id
+	FROM candidate_dates cd
+	JOIN calendar_dates ex
+	  ON ex.date = to_char(cd.d, 'YYYYMMDD')
+	 AND ex.exception_type = '1'
+),
+active_services_dedup AS (
+	SELECT DISTINCT service_date, service_id FROM active_services
+),
+candidates AS (
+	SELECT DISTINCT ON (st.stop_id, st.trip_id, a.service_date)
+		st.stop_id,
+		st.trip_id,
+		t.route_id,
+		t.trip_headsign,
+		a.service_date,
+		(a.service_date::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time
+	FROM stop_times st
+	JOIN trips t ON t.trip_id = st.trip_id
+	JOIN active_services_dedup a ON a.service_id = t.service_id
+	WHERE st.stop_id = ANY($2::text[])
+	ORDER BY st.stop_id, st.trip_id, a.service_date
+)
+SELECT
+	c.stop_id,
+	c.trip_id,
+	c.route_id,
+	COALESCE(r.route_short_name, ''),
+	COALESCE(c.trip_headsign, ''),
+	c.scheduled_time,
+	COALESCE(
+		c.scheduled_time + (rt.arrival_delay || ' seconds')::interval,
+		c.scheduled_time
+	) AS estimated_time,
+	(rt.trip_id IS NOT NULL) AS is_realtime
+FROM candidates c
+LEFT JOIN routes r ON r.route_id = c.route_id
+LEFT JOIN LATERAL (
+	SELECT rt_inner.trip_id, rt_inner.arrival_delay
+	FROM trip_update_stop_times_current rt_inner
+	WHERE rt_inner.trip_id = c.trip_id AND rt_inner.stop_id = c.stop_id
+	LIMIT 1
+) rt ON true
+WHERE c.scheduled_time >= (SELECT at FROM at_ts)
+  AND c.scheduled_time <= (SELECT at FROM at_ts) + ($3::int || ' minutes')::interval
+ORDER BY c.scheduled_time, c.stop_id, c.trip_id
+LIMIT $4 OFFSET $5
+`
+	rows, err := r.pool.Query(ctx, q, at, stopIDs, windowMinutes, limit, offset)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query normalized arrivals: %w", err)
+	}
+	defer rows.Close()
+
+	stopOut := make([]string, 0, limit)
+	arrOut := make([]models.StopArrivalLite, 0, limit)
+	for rows.Next() {
+		var (
+			stopID string
+			a      models.StopArrivalLite
+		)
+		if err = rows.Scan(
+			&stopID, &a.TripID, &a.RouteID, &a.RouteShortName, &a.Headsign,
+			&a.ScheduledTime, &a.EstimatedTime, &a.IsRealtime,
+		); err != nil {
+			return nil, nil, fmt.Errorf("scan normalized arrival: %w", err)
+		}
+		stopOut = append(stopOut, stopID)
+		arrOut = append(arrOut, a)
+	}
+	return stopOut, arrOut, rows.Err()
+}
+
 // ============================================================================
 // Routes
 // ============================================================================
@@ -1230,6 +1348,110 @@ LEFT JOIN routes r ON r.route_id = x.route_id AND x.route_id <> ''
 	return out, rows.Err()
 }
 
+type routeDisplayName struct {
+	short, long string
+}
+
+func (r *Repository) lookupRouteDisplayNames(ctx context.Context, routeIDs []string) (map[string]routeDisplayName, error) {
+	out := make(map[string]routeDisplayName)
+	if len(routeIDs) == 0 {
+		return out, nil
+	}
+	const q = `
+SELECT route_id,
+	COALESCE(NULLIF(TRIM(route_short_name), ''), ''),
+	COALESCE(NULLIF(TRIM(route_long_name), ''), '')
+FROM routes
+WHERE route_id = ANY($1::text[])
+`
+	rows, err := r.pool.Query(ctx, q, routeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("lookup route display names: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, sn, ln string
+		if err = rows.Scan(&id, &sn, &ln); err != nil {
+			return nil, fmt.Errorf("scan route display name: %w", err)
+		}
+		out[id] = routeDisplayName{short: sn, long: ln}
+	}
+	return out, rows.Err()
+}
+
+// EnrichVehiclesWithInferredRoutes fills route_id and route names when the realtime row has no route,
+// using the same nearest-stop + shape heuristics as unassigned_hints. Sets RouteInferred on those rows.
+func (r *Repository) EnrichVehiclesWithInferredRoutes(ctx context.Context, vehicles []models.Vehicle) error {
+	var ids []string
+	seen := map[string]struct{}{}
+	for i := range vehicles {
+		if strings.TrimSpace(vehicles[i].RouteID) != "" {
+			continue
+		}
+		id := strings.TrimSpace(vehicles[i].VehicleID)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil
+	}
+	if len(ids) > 500 {
+		ids = ids[:500]
+	}
+	hints, err := r.GetUnassignedVehicleHints(ctx, len(ids), ids)
+	if err != nil {
+		return err
+	}
+	routePick := make(map[string]string, len(hints))
+	for _, h := range hints {
+		picked := strings.TrimSpace(h.BestRouteID)
+		if picked == "" && len(h.PossibleRouteIDs) == 1 {
+			picked = h.PossibleRouteIDs[0]
+		}
+		if picked == "" && len(h.RankedRoutes) > 0 && h.RankedRoutes[0].DistanceM < 1e14 && h.RankedRoutes[0].DistanceM <= 1200 {
+			picked = h.RankedRoutes[0].RouteID
+		}
+		if picked != "" {
+			routePick[h.VehicleID] = picked
+		}
+	}
+	var routeIDs []string
+	seenR := map[string]struct{}{}
+	for _, rid := range routePick {
+		if _, ok := seenR[rid]; ok {
+			continue
+		}
+		seenR[rid] = struct{}{}
+		routeIDs = append(routeIDs, rid)
+	}
+	names, err := r.lookupRouteDisplayNames(ctx, routeIDs)
+	if err != nil {
+		return err
+	}
+	for i := range vehicles {
+		if strings.TrimSpace(vehicles[i].RouteID) != "" {
+			continue
+		}
+		rid, ok := routePick[vehicles[i].VehicleID]
+		if !ok || rid == "" {
+			continue
+		}
+		vehicles[i].RouteID = rid
+		vehicles[i].RouteInferred = true
+		if n, ok := names[rid]; ok {
+			vehicles[i].ShortName = n.short
+			vehicles[i].LongName = n.long
+		}
+	}
+	return nil
+}
+
 // GetRoutesWithLiveVehicleCounts returns per-route vehicle counts (canonical routes.route_id only)
 // and how many vehicles could not be tied to any route. Routes slice omits zero counts.
 func (r *Repository) GetRoutesWithLiveVehicleCounts(ctx context.Context) (models.RoutesWithLiveVehiclesPayload, error) {
@@ -1287,14 +1509,23 @@ ORDER BY route_id
 
 const maxPossibleRoutesPerHint = 8
 
-// GetUnassignedVehicleHints returns up to maxVehicles unassigned positions with nearest-stop distance
-// and possible_route_ids (routes serving that stop). This is a heuristic for UI only, not ground truth.
-func (r *Repository) GetUnassignedVehicleHints(ctx context.Context, maxVehicles int) ([]models.UnassignedVehicleHint, error) {
-	if maxVehicles <= 0 {
-		maxVehicles = 80
+// GetUnassignedVehicleHints returns unassigned positions with nearest-stop distance and possible_route_ids.
+// filterVehicleIDs: when non-empty, only those vehicle_ids are considered (for map vehicle enrichment); pass nil
+// for the usual “first N unassigned” behavior capped by maxVehicles.
+func (r *Repository) GetUnassignedVehicleHints(ctx context.Context, maxVehicles int, filterVehicleIDs []string) ([]models.UnassignedVehicleHint, error) {
+	limit := maxVehicles
+	if limit <= 0 {
+		limit = 80
 	}
-	if maxVehicles > 150 {
-		maxVehicles = 150
+	if len(filterVehicleIDs) == 0 && limit > 150 {
+		limit = 150
+	}
+	if len(filterVehicleIDs) > 0 {
+		limit = len(filterVehicleIDs)
+		if limit > 500 {
+			limit = 500
+			filterVehicleIDs = filterVehicleIDs[:500]
+		}
 	}
 	const q = `
 WITH unassigned AS (
@@ -1314,6 +1545,11 @@ WITH unassigned AS (
 			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
 			''
 		) = ''
+	  AND (
+			array_length($2::text[], 1) IS NULL
+			OR array_length($2::text[], 1) = 0
+			OR v.vehicle_id = ANY($2::text[])
+	  )
 	LIMIT $1
 ),
 nearest AS (
@@ -1357,13 +1593,17 @@ GROUP BY
 	n.vehicle_id, n.trip_id, n.lat, n.lon, n.bearing, n.speed, n.nearest_stop_id, n.nearest_stop_m
 ORDER BY n.vehicle_id
 `
-	rows, err := r.pool.Query(ctx, q, maxVehicles)
+	filterArg := []string{}
+	if len(filterVehicleIDs) > 0 {
+		filterArg = filterVehicleIDs
+	}
+	rows, err := r.pool.Query(ctx, q, limit, filterArg)
 	if err != nil {
 		return nil, fmt.Errorf("unassigned vehicle hints: %w", err)
 	}
 	defer rows.Close()
 
-	out := make([]models.UnassignedVehicleHint, 0, maxVehicles)
+	out := make([]models.UnassignedVehicleHint, 0, limit)
 	for rows.Next() {
 		var (
 			h         models.UnassignedVehicleHint
@@ -1393,8 +1633,8 @@ ORDER BY n.vehicle_id
 
 const (
 	maxRoutesToRankPerHint = 6
-	bestRouteMaxDistM      = 500.0
-	bestRouteSecondGapM    = 20.0
+	bestRouteMaxDistM      = 720.0
+	bestRouteSecondGapM    = 14.0
 )
 
 // attachShapeProximityRanking fills ranked_routes and optionally best_route_id using min distance
@@ -1432,6 +1672,13 @@ func (r *Repository) attachShapeProximityRanking(ctx context.Context, h *models.
 	if ranked[1].DistanceM-first.DistanceM >= bestRouteSecondGapM {
 		h.BestRouteID = first.RouteID
 	}
+	// Last resort: closest shape within ~900 m so clients still get a line when gaps are ambiguous.
+	if h.BestRouteID == "" && len(h.RankedRoutes) > 0 {
+		d := h.RankedRoutes[0].DistanceM
+		if d < 1e14 && d <= 900 {
+			h.BestRouteID = h.RankedRoutes[0].RouteID
+		}
+	}
 }
 
 func (r *Repository) rankRoutesByShapeProximity(ctx context.Context, lon, lat float64, routeIDs []string) ([]models.RouteProximityRank, error) {
@@ -1459,7 +1706,7 @@ LEFT JOIN LATERAL (
 		GROUP BY t.shape_id
 		ORDER BY COUNT(*) DESC
 		LIMIT 1
-	) rep ON rep.shape_id = sh.shape_id
+	) rep ON TRIM(BOTH FROM rep.shape_id::text) = TRIM(BOTH FROM sh.shape_id::text)
 	WHERE sh.shape_pt_lat IS NOT NULL AND sh.shape_pt_lon IS NOT NULL
 ) sh ON true
 GROUP BY u.route_id
@@ -1503,4 +1750,3 @@ func splitRouteCSV(csv string, max int) []string {
 	}
 	return out
 }
-

@@ -21,26 +21,29 @@ type ResponseEnvelope struct {
 }
 
 type Meta struct {
-	Total            int      `json:"total,omitempty"`
-	Limit            int      `json:"limit,omitempty"`
-	Page             int      `json:"page,omitempty"`
-	HasNext          bool     `json:"has_next,omitempty"`
-	ServiceDate      string   `json:"service_date,omitempty"`
-	RequestedRoutes  int      `json:"requested_routes,omitempty"`  // overlay: ids in the query
-	MissingRouteIds  []string `json:"missing_route_ids,omitempty"` // overlay: no drawable geometry / unknown route
+	Total           int      `json:"total,omitempty"`
+	Limit           int      `json:"limit,omitempty"`
+	Page            int      `json:"page,omitempty"`
+	HasNext         bool     `json:"has_next,omitempty"`
+	NextCursor      string   `json:"next_cursor,omitempty"`
+	ServiceDate     string   `json:"service_date,omitempty"`
+	RequestedRoutes int      `json:"requested_routes,omitempty"`  // overlay: ids in the query
+	MissingRouteIds []string `json:"missing_route_ids,omitempty"` // overlay: no drawable geometry / unknown route
 }
 
 type Vehicle struct {
-	VehicleID string   `json:"vehicle_id"`
-	TripID    string   `json:"trip_id,omitempty"`
+	VehicleID string `json:"vehicle_id"`
+	TripID    string `json:"trip_id,omitempty"`
 	// RouteID is always canonical GTFS routes.route_id when resolvable (vehicle row, else trips.route_id).
-	RouteID   string   `json:"route_id,omitempty"`
-	ShortName string   `json:"route_short_name,omitempty"` // from routes; display / fallback join
-	LongName  string   `json:"route_long_name,omitempty"`
-	Lat       float64  `json:"lat"`
-	Lon       float64  `json:"lon"`
-	Bearing   *float64 `json:"bearing,omitempty"`
-	Speed     *float64 `json:"speed,omitempty"`
+	RouteID   string `json:"route_id,omitempty"`
+	ShortName string `json:"route_short_name,omitempty"` // from routes; display / fallback join
+	LongName  string `json:"route_long_name,omitempty"`
+	// RouteInferred is true when RouteID was filled from nearest-stop / shape heuristics (feed omitted route).
+	RouteInferred bool     `json:"route_inferred,omitempty"`
+	Lat           float64  `json:"lat"`
+	Lon           float64  `json:"lon"`
+	Bearing       *float64 `json:"bearing,omitempty"`
+	Speed         *float64 `json:"speed,omitempty"`
 }
 
 // RouteLiveVehicleCount is one route that currently has at least one vehicle in the feed.
@@ -52,9 +55,9 @@ type RouteLiveVehicleCount struct {
 // RoutesWithLiveVehiclesPayload is GET /v1/map/routes-with-live-vehicles.
 // Routes lists only route_id values with count ≥ 1; merge with static route catalog on the client for zeros.
 type RoutesWithLiveVehiclesPayload struct {
-	Routes                 []RouteLiveVehicleCount  `json:"routes"`
-	UnassignedVehicleCount int                      `json:"unassigned_vehicle_count"`
-	TotalVehicles            int                      `json:"total_vehicles"`
+	Routes                 []RouteLiveVehicleCount `json:"routes"`
+	UnassignedVehicleCount int                     `json:"unassigned_vehicle_count"`
+	TotalVehicles          int                     `json:"total_vehicles"`
 	// UnassignedHints is set only when includeUnassignedHints=1: location + heuristic candidate routes (nearest stop).
 	UnassignedHints []UnassignedVehicleHint `json:"unassigned_hints,omitempty"`
 }
@@ -86,7 +89,7 @@ type UnassignedVehicleHint struct {
 
 type StopSummary struct {
 	StopID     string  `json:"stop_id"`
-	ID         string  `json:"id,omitempty"`            // same as stop_id (map clients)
+	ID         string  `json:"id,omitempty"`           // same as stop_id (map clients)
 	GtfsStopID string  `json:"gtfs_stop_id,omitempty"` // same as stop_id (alt parsers)
 	StopName   string  `json:"stop_name,omitempty"`
 	StopCode   string  `json:"stop_code,omitempty"`
@@ -157,14 +160,14 @@ type MapRouteLeg struct {
 
 // MapRouteWithGeometry is everything the map needs to draw one line + markers for a route.
 type MapRouteWithGeometry struct {
-	RouteID        string         `json:"route_id"`
-	ShortName      string         `json:"short_name,omitempty"`
-	LongName       string         `json:"long_name,omitempty"`
-	RouteColor     string         `json:"route_color,omitempty"`
-	RouteTextColor string         `json:"route_text_color,omitempty"`
-	Legs           []MapRouteLeg  `json:"legs"`
-	AllStops       []StopSummary  `json:"all_stops,omitempty"` // deduped union of leg.stops (route-level pins)
-	Stops          []StopSummary  `json:"stops,omitempty"`       // same as AllStops (some parsers expect route.stops)
+	RouteID        string        `json:"route_id"`
+	ShortName      string        `json:"short_name,omitempty"`
+	LongName       string        `json:"long_name,omitempty"`
+	RouteColor     string        `json:"route_color,omitempty"`
+	RouteTextColor string        `json:"route_text_color,omitempty"`
+	Legs           []MapRouteLeg `json:"legs"`
+	AllStops       []StopSummary `json:"all_stops,omitempty"` // deduped union of leg.stops (route-level pins)
+	Stops          []StopSummary `json:"stops,omitempty"`     // same as AllStops (some parsers expect route.stops)
 }
 
 // MapRoutesOverlayPayload is the data envelope for GET /v1/map/routes-overlay.
@@ -172,17 +175,44 @@ type MapRoutesOverlayPayload struct {
 	Routes []MapRouteWithGeometry `json:"routes"`
 }
 
+// MapNormalizedPayload is a mobile-optimized relational shape:
+// - routes/stops are ID-indexed dictionaries for O(1) lookups
+// - junctions maps route_id -> ordered stop_ids
+// - route_geometries keeps encoded polylines separate from entities
+type MapNormalizedPayload struct {
+	Routes          map[string]RouteMapLite `json:"routes"`
+	Stops           map[string]StopSummary  `json:"stops"`
+	Junctions       map[string][]string     `json:"junctions"`
+	RouteGeometries map[string]string       `json:"route_geometries"`
+}
+
+// StopArrivalLite is a flat, pre-sorted row for mobile timetable rendering.
+type StopArrivalLite struct {
+	TripID         string    `json:"trip_id"`
+	RouteID        string    `json:"route_id,omitempty"`
+	RouteShortName string    `json:"route_short_name,omitempty"`
+	Headsign       string    `json:"headsign,omitempty"`
+	ScheduledTime  time.Time `json:"scheduled_time"`
+	EstimatedTime  time.Time `json:"estimated_time"`
+	IsRealtime     bool      `json:"is_realtime"`
+}
+
+// ArrivalsNormalizedPayload groups pre-sorted arrivals by stop_id.
+type ArrivalsNormalizedPayload struct {
+	Arrivals map[string][]StopArrivalLite `json:"arrivals"`
+}
+
 type Trip struct {
-	TripID        string `json:"trip_id"`
-	RouteID       string `json:"route_id,omitempty"`
-	ServiceID     string `json:"service_id,omitempty"`
-	Headsign      string `json:"headsign,omitempty"`
-	ShortName     string `json:"short_name,omitempty"`
-	DirectionID   string `json:"direction_id,omitempty"`
-	BlockID       string `json:"block_id,omitempty"`
-	ShapeID       string `json:"shape_id,omitempty"`
-	Wheelchair    string `json:"wheelchair_accessible,omitempty"`
-	BikesAllowed  string `json:"bikes_allowed,omitempty"`
+	TripID       string `json:"trip_id"`
+	RouteID      string `json:"route_id,omitempty"`
+	ServiceID    string `json:"service_id,omitempty"`
+	Headsign     string `json:"headsign,omitempty"`
+	ShortName    string `json:"short_name,omitempty"`
+	DirectionID  string `json:"direction_id,omitempty"`
+	BlockID      string `json:"block_id,omitempty"`
+	ShapeID      string `json:"shape_id,omitempty"`
+	Wheelchair   string `json:"wheelchair_accessible,omitempty"`
+	BikesAllowed string `json:"bikes_allowed,omitempty"`
 }
 
 type TripStopTime struct {
@@ -227,7 +257,7 @@ type CalendarService struct {
 
 type CalendarException struct {
 	ServiceID     string `json:"service_id"`
-	Date          string `json:"date"` // YYYY-MM-DD
+	Date          string `json:"date"`           // YYYY-MM-DD
 	ExceptionType string `json:"exception_type"` // "1" added, "2" removed (GTFS)
 }
 
@@ -236,9 +266,9 @@ type ActiveServiceOnDay struct {
 	ServiceID string `json:"service_id"`
 	Source    string `json:"source"` // calendar | exception_added
 	// Filled when detail=true (GET /v1/gtfs/calendar/day?detail=true)
-	Calendar          *CalendarService    `json:"calendar,omitempty"`
-	ExceptionsToday   []CalendarException `json:"exceptions_today,omitempty"` // calendar_dates rows for this service_id on D
-	Display           *ServiceDisplay     `json:"display,omitempty"`
+	Calendar        *CalendarService    `json:"calendar,omitempty"`
+	ExceptionsToday []CalendarException `json:"exceptions_today,omitempty"` // calendar_dates rows for this service_id on D
+	Display         *ServiceDisplay     `json:"display,omitempty"`
 }
 
 // ServiceDisplay is derived metadata for UI chips (replaces static SERVICE_META where possible).
@@ -252,10 +282,10 @@ type ServiceDisplay struct {
 
 // CalendarDayPayload is GET /v1/gtfs/calendar/day.
 type CalendarDayPayload struct {
-	Date                 string               `json:"date"` // YYYY-MM-DD
-	Services             []ActiveServiceOnDay `json:"services"`
-	CalendarDateEvents   []CalendarException  `json:"calendar_date_events,omitempty"` // all calendar_dates rows on D
-	FeedCalendarWindow   *FeedCalendarWindow  `json:"feed_calendar_window,omitempty"` // when include=window
+	Date               string               `json:"date"` // YYYY-MM-DD
+	Services           []ActiveServiceOnDay `json:"services"`
+	CalendarDateEvents []CalendarException  `json:"calendar_date_events,omitempty"` // all calendar_dates rows on D
+	FeedCalendarWindow *FeedCalendarWindow  `json:"feed_calendar_window,omitempty"` // when include=window
 }
 
 // FeedCalendarWindow is min/max dates across calendar + calendar_dates (static GTFS coverage).
@@ -293,6 +323,13 @@ type RouteShape struct {
 	ShapeID     string            `json:"shape_id"`
 	Points      []RouteShapePoint `json:"points"`
 	TotalPoints int               `json:"total_points,omitempty"`
+}
+
+type RouteShapeEncoded struct {
+	RouteID         string `json:"route_id"`
+	ShapeID         string `json:"shape_id"`
+	EncodedPolyline string `json:"encoded_polyline"`
+	TotalPoints     int    `json:"total_points,omitempty"`
 }
 
 type RouteDirection struct {

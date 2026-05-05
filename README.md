@@ -22,8 +22,11 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 
 - `GET /v1/map/vehicles` - active vehicles; canonical `route_id` (realtime row or `trips.route_id`), plus `route_short_name` / `route_long_name` from static `routes` when the route exists
 - `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`
-- `GET /v1/realtime/trip-updates?limit=500` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); `data` is a JSON array matching your DB columns
-- `GET /v1/realtime/alerts?limit=500` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); `data` is a JSON array matching your DB columns
+- `GET /v1/map/routes-normalized?routeIds=...` - mobile-optimized relational map payload: `routes`/`stops` dictionaries, `junctions` (`route_id -> stop_id[]`), and `route_geometries` as encoded polylines
+- `GET /v1/map/arrivals-normalized?stopIds=...&limit=500&cursor=...` - stop-indexed, pre-sorted arrivals for list rendering; cursor pagination via `meta.next_cursor`
+- `GET /v1/gtfs/routes/{routeId}/shape-encoded` - map-optimized geometry as Google encoded polyline (smaller payload than raw point arrays)
+- `GET /v1/realtime/trip-updates?limit=500&cursor=...` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); cursor pagination via `meta.next_cursor`
+- `GET /v1/realtime/alerts?limit=500&cursor=...` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); cursor pagination via `meta.next_cursor`
 - `GET /v1/routes` - route list from `routes`
 - `GET /v1/stops/{id}/schedule` - next 5 departures, realtime fallback to static
 - `GET /v1/stops/nearby?lat={lat}&lon={lon}&radius_meters={r}` - nearby stop search
