@@ -724,6 +724,36 @@ paths:
         "400":
           description: Missing or invalid stopIds/cursor/at
 
+  /v1/map/arrivals-next:
+    get:
+      tags: [Map]
+      summary: One upcoming arrival per stop_id (lightweight)
+      description: |
+        Returns a dictionary keyed by `stop_id` with only the next upcoming arrival row for each stop.
+        Useful for map badges/chips where full per-stop lists are unnecessary.
+      parameters:
+        - in: query
+          name: stopIds
+          required: true
+          description: Comma-separated `stop_id` values (max 250)
+          schema: { type: string }
+        - in: query
+          name: at
+          description: ISO 8601 timestamp (defaults to now)
+          schema: { type: string, format: date-time }
+        - in: query
+          name: windowMinutes
+          description: Minutes ahead to include (default 180, max 360)
+          schema: { type: integer, minimum: 1, maximum: 360, default: 180 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ArrivalsNextResponse" }
+        "400":
+          description: Missing or invalid stopIds/at
+
   /v1/map/static:
     get:
       tags: [Map]
@@ -1519,6 +1549,22 @@ components:
       properties:
         status: { $ref: "#/components/schemas/APIStatus" }
         data: { $ref: "#/components/schemas/ArrivalsNormalizedPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    ArrivalsNextPayload:
+      type: object
+      required: [arrivals]
+      properties:
+        arrivals:
+          type: object
+          description: Dictionary keyed by stop_id.
+          additionalProperties: { $ref: "#/components/schemas/StopArrivalLite" }
+
+    ArrivalsNextResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/ArrivalsNextPayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     VehiclesResponse:

@@ -129,6 +129,8 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/map/routes-normalized", staticCache(http.HandlerFunc(s.handleMapRoutesNormalized)))
 	// Map: normalized stop_id -> arrivals[] for flat list rendering
 	mux.Handle("GET /v1/map/arrivals-normalized", dynamicCache(http.HandlerFunc(s.handleArrivalsNormalized)))
+	// Map: one next arrival row per stop_id (lightweight badges/chips)
+	mux.Handle("GET /v1/map/arrivals-next", dynamicCache(http.HandlerFunc(s.handleArrivalsNext)))
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
@@ -718,6 +720,83 @@ func (s *Server) handleArrivalsNormalized(w http.ResponseWriter, r *http.Request
 			Limit:      limit,
 			NextCursor: nextCursorForCount(len(rows), offset, limit),
 		},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, realtimeTripCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleArrivalsNext(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	raw := strings.TrimSpace(q.Get("stopIds"))
+	multi := q["stopIds"]
+	var parts []string
+	if len(multi) > 1 {
+		parts = multi
+	} else if raw != "" {
+		parts = strings.Split(raw, ",")
+	}
+	if len(parts) == 0 {
+		httpError(w, http.StatusBadRequest, "stopIds is required (comma-separated or repeated query values)")
+		return
+	}
+	seen := make(map[string]struct{}, len(parts))
+	stopIDs := make([]string, 0, len(parts))
+	for _, p := range parts {
+		id := strings.TrimSpace(p)
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		stopIDs = append(stopIDs, id)
+		if len(stopIDs) >= 250 {
+			break
+		}
+	}
+	if len(stopIDs) == 0 {
+		httpError(w, http.StatusBadRequest, "no valid stop ids")
+		return
+	}
+
+	at := time.Now()
+	if rawAt := strings.TrimSpace(q.Get("at")); rawAt != "" {
+		v, err := time.Parse(time.RFC3339, rawAt)
+		if err != nil {
+			httpError(w, http.StatusBadRequest, "invalid at (use RFC3339)")
+			return
+		}
+		at = v
+	}
+	window := clamp(parseIntOr(q.Get("windowMinutes"), 180), 1, 360)
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+	cacheKey := "arrivals_next:" + strings.Join(stopIDs, ",") + "|" + at.UTC().Format(time.RFC3339) + "|" + strconv.Itoa(window)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	arrivals, err := s.repo.GetNextArrivalsPerStop(ctx, stopIDs, at, window)
+	if err != nil {
+		log.Printf("arrivals next: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load next arrivals")
+		return
+	}
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   models.ArrivalsNextPayload{Arrivals: arrivals},
+		Meta:   &models.Meta{Total: len(arrivals)},
 	}
 	s.cache.SetWithTTL(cacheKey, resp, realtimeTripCacheTTL)
 	writeJSON(w, http.StatusOK, resp)
@@ -1577,8 +1656,8 @@ func (s *Server) handleVehicles(w http.ResponseWriter, r *http.Request) {
 	if inferRoute {
 		if err = s.repo.EnrichVehiclesWithInferredRoutes(ctx, vehicles); err != nil {
 			log.Printf("vehicles infer route: %v", err)
-			httpError(w, http.StatusInternalServerError, "failed to infer routes for vehicles")
-			return
+			// Keep /v1/map/vehicles available even if heuristic inference fails in prod;
+			// clients still receive canonical feed/trip-resolved routes.
 		}
 	}
 

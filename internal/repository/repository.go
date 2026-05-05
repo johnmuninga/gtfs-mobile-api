@@ -471,6 +471,114 @@ LIMIT $4 OFFSET $5
 	return stopOut, arrOut, rows.Err()
 }
 
+// GetNextArrivalsPerStop returns at most one next arrival row per stop_id in stopIDs.
+func (r *Repository) GetNextArrivalsPerStop(ctx context.Context, stopIDs []string, at time.Time, windowMinutes int) (map[string]models.StopArrivalLite, error) {
+	if len(stopIDs) == 0 {
+		return map[string]models.StopArrivalLite{}, nil
+	}
+	const q = `
+WITH at_ts AS (
+	SELECT $1::timestamptz AS at
+),
+candidate_dates AS (
+	SELECT (at::date) AS d FROM at_ts
+	UNION SELECT (at::date - INTERVAL '1 day')::date FROM at_ts
+),
+active_services AS (
+	SELECT cd.d AS service_date, c.service_id
+	FROM candidate_dates cd
+	JOIN calendar c
+	  ON to_date(c.start_date, 'YYYYMMDD') <= cd.d
+	 AND to_date(c.end_date,   'YYYYMMDD') >= cd.d
+	 AND CASE EXTRACT(ISODOW FROM cd.d)
+			WHEN 1 THEN c.monday
+			WHEN 2 THEN c.tuesday
+			WHEN 3 THEN c.wednesday
+			WHEN 4 THEN c.thursday
+			WHEN 5 THEN c.friday
+			WHEN 6 THEN c.saturday
+			WHEN 7 THEN c.sunday
+		 END = '1'
+	WHERE NOT EXISTS (
+		SELECT 1 FROM calendar_dates ex
+		WHERE ex.service_id = c.service_id
+		  AND ex.date = to_char(cd.d, 'YYYYMMDD')
+		  AND ex.exception_type = '2'
+	)
+	UNION
+	SELECT cd.d AS service_date, ex.service_id
+	FROM candidate_dates cd
+	JOIN calendar_dates ex
+	  ON ex.date = to_char(cd.d, 'YYYYMMDD')
+	 AND ex.exception_type = '1'
+),
+active_services_dedup AS (
+	SELECT DISTINCT service_date, service_id FROM active_services
+),
+candidates AS (
+	SELECT DISTINCT ON (st.stop_id, st.trip_id, a.service_date)
+		st.stop_id,
+		st.trip_id,
+		t.route_id,
+		t.trip_headsign,
+		a.service_date,
+		(a.service_date::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time
+	FROM stop_times st
+	JOIN trips t ON t.trip_id = st.trip_id
+	JOIN active_services_dedup a ON a.service_id = t.service_id
+	WHERE st.stop_id = ANY($2::text[])
+	ORDER BY st.stop_id, st.trip_id, a.service_date
+),
+ranked AS (
+SELECT
+	c.stop_id,
+	c.trip_id,
+	c.route_id,
+	COALESCE(r.route_short_name, '') AS route_short_name,
+	COALESCE(c.trip_headsign, '') AS headsign,
+	c.scheduled_time,
+	COALESCE(
+		c.scheduled_time + (rt.arrival_delay || ' seconds')::interval,
+		c.scheduled_time
+	) AS estimated_time,
+	(rt.trip_id IS NOT NULL) AS is_realtime,
+	ROW_NUMBER() OVER (PARTITION BY c.stop_id ORDER BY c.scheduled_time, c.trip_id) AS rn
+FROM candidates c
+LEFT JOIN routes r ON r.route_id = c.route_id
+LEFT JOIN LATERAL (
+	SELECT rt_inner.trip_id, rt_inner.arrival_delay
+	FROM trip_update_stop_times_current rt_inner
+	WHERE rt_inner.trip_id = c.trip_id AND rt_inner.stop_id = c.stop_id
+	LIMIT 1
+) rt ON true
+WHERE c.scheduled_time >= (SELECT at FROM at_ts)
+  AND c.scheduled_time <= (SELECT at FROM at_ts) + ($3::int || ' minutes')::interval
+)
+SELECT stop_id, trip_id, route_id, route_short_name, headsign, scheduled_time, estimated_time, is_realtime
+FROM ranked
+WHERE rn = 1
+ORDER BY stop_id
+`
+	rows, err := r.pool.Query(ctx, q, at, stopIDs, windowMinutes)
+	if err != nil {
+		return nil, fmt.Errorf("query next arrivals per stop: %w", err)
+	}
+	defer rows.Close()
+
+	out := make(map[string]models.StopArrivalLite, len(stopIDs))
+	for rows.Next() {
+		var (
+			stopID string
+			a      models.StopArrivalLite
+		)
+		if err = rows.Scan(&stopID, &a.TripID, &a.RouteID, &a.RouteShortName, &a.Headsign, &a.ScheduledTime, &a.EstimatedTime, &a.IsRealtime); err != nil {
+			return nil, fmt.Errorf("scan next arrival per stop: %w", err)
+		}
+		out[stopID] = a
+	}
+	return out, rows.Err()
+}
+
 // ============================================================================
 // Routes
 // ============================================================================

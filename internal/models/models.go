@@ -202,6 +202,11 @@ type ArrivalsNormalizedPayload struct {
 	Arrivals map[string][]StopArrivalLite `json:"arrivals"`
 }
 
+// ArrivalsNextPayload returns one upcoming arrival per stop_id.
+type ArrivalsNextPayload struct {
+	Arrivals map[string]StopArrivalLite `json:"arrivals"`
+}
+
 type Trip struct {
 	TripID       string `json:"trip_id"`
 	RouteID      string `json:"route_id,omitempty"`
