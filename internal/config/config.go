@@ -22,6 +22,9 @@ type Config struct {
 	// Override if your ingest uses different names (must be identifier-safe: letters, digits, underscore).
 	RealtimeTripUpdatesTable string
 	RealtimeAlertsTable      string
+	// VehicleIngestKey authorizes POST /v1/vehicle-position without user JWT.
+	// Send as X-Vehicle-Ingest-Key header from trusted device/collector only.
+	VehicleIngestKey string
 }
 
 func Load() (Config, error) {
@@ -37,6 +40,7 @@ func Load() (Config, error) {
 		HealthcheckSecret:         os.Getenv("HEALTHCHECK_SECRET"),
 		RealtimeTripUpdatesTable:  getenv("REALTIME_TRIP_UPDATES_TABLE", "trip_updates_current"),
 		RealtimeAlertsTable:       getenv("REALTIME_ALERTS_TABLE", "service_alerts_current"),
+		VehicleIngestKey:          os.Getenv("VEHICLE_INGEST_KEY"),
 	}
 
 	if cfg.SupabaseDBURL == "" {
@@ -64,4 +68,3 @@ func getenvInt(key string, fallback int) int {
 	}
 	return n
 }
-

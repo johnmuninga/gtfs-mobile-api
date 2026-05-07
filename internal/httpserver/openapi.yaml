@@ -812,6 +812,7 @@ paths:
       summary: Active vehicle positions
       description: |
         Each vehicle includes canonical `route_id` (static `routes.route_id`), resolved from the realtime row or from `trips` via `trip_id`, plus `route_short_name` / `route_long_name` from `routes` when the route exists.
+        Only rows updated in the last 2 minutes are returned.
 
         By default (`inferRoute` omitted or true), vehicles the feed left unassigned get `route_id` filled from nearest-stop + shape-distance heuristics (same family as `unassigned_hints`); `route_inferred: true` marks those rows. Send `inferRoute=0` or `false` to skip that pass (faster).
       parameters:
@@ -825,6 +826,36 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/VehiclesResponse" }
+
+  /v1/map/vehicles/live:
+    get:
+      tags: [Realtime]
+      summary: Live vehicle updates over WebSocket
+      description: |
+        Upgrade to WebSocket and receive `vehicle.upsert` events as positions are ingested.
+        A full initial snapshot is sent first as upsert events, then incremental updates.
+      responses:
+        "101":
+          description: Switching Protocols
+
+  /v1/vehicle-position:
+    post:
+      tags: [Realtime]
+      summary: Ingest a vehicle GPS update
+      description: |
+        Trusted ingest endpoint for devices/collector services. Authorize with either:
+        - `X-Vehicle-Ingest-Key: <VEHICLE_INGEST_KEY>`
+        - or user Bearer JWT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VehiclePositionIngestRequest" }
+      responses:
+        "202":
+          description: Accepted
+        "400":
+          description: Invalid payload
 
   /v1/map/routes-with-live-vehicles:
     get:
@@ -1048,7 +1079,7 @@ components:
 
     Vehicle:
       type: object
-      required: [vehicle_id, lat, lon]
+      required: [vehicle_id, lat, lon, updated_at, is_live]
       properties:
         vehicle_id: { type: string }
         trip_id: { type: string }
@@ -1062,6 +1093,24 @@ components:
         lon: { type: number }
         bearing: { type: number }
         speed: { type: number }
+        updated_at: { type: string, format: date-time }
+        is_live: { type: boolean }
+
+    VehiclePositionIngestRequest:
+      type: object
+      required: [vehicle_id, lat, lon]
+      properties:
+        vehicle_id: { type: string }
+        trip_id: { type: string }
+        route_id: { type: string }
+        lat: { type: number }
+        lon: { type: number }
+        bearing: { type: number }
+        speed: { type: number }
+        updated_at:
+          type: string
+          format: date-time
+          description: Optional RFC3339 timestamp; defaults to server now.
 
     RouteLiveVehicleCount:
       type: object

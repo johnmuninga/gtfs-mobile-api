@@ -39,11 +39,13 @@ type Vehicle struct {
 	ShortName string `json:"route_short_name,omitempty"` // from routes; display / fallback join
 	LongName  string `json:"route_long_name,omitempty"`
 	// RouteInferred is true when RouteID was filled from nearest-stop / shape heuristics (feed omitted route).
-	RouteInferred bool     `json:"route_inferred,omitempty"`
-	Lat           float64  `json:"lat"`
-	Lon           float64  `json:"lon"`
-	Bearing       *float64 `json:"bearing,omitempty"`
-	Speed         *float64 `json:"speed,omitempty"`
+	RouteInferred bool      `json:"route_inferred,omitempty"`
+	Lat           float64   `json:"lat"`
+	Lon           float64   `json:"lon"`
+	Bearing       *float64  `json:"bearing,omitempty"`
+	Speed         *float64  `json:"speed,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	IsLive        bool      `json:"is_live"`
 }
 
 // RouteLiveVehicleCount is one route that currently has at least one vehicle in the feed.

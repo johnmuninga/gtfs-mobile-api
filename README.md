@@ -21,6 +21,8 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 ## Endpoints
 
 - `GET /v1/map/vehicles` - active vehicles; canonical `route_id` (realtime row or `trips.route_id`), plus `route_short_name` / `route_long_name` from static `routes` when the route exists
+- `GET /v1/map/vehicles/live` - WebSocket stream of `vehicle.upsert` events (initial snapshot + incremental updates)
+- `POST /v1/vehicle-position` - trusted ingest endpoint to upsert GPS and push live updates to WebSocket clients
 - `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`
 - `GET /v1/map/routes-normalized?routeIds=...` - mobile-optimized relational map payload: `routes`/`stops` dictionaries, `junctions` (`route_id -> stop_id[]`), and `route_geometries` as encoded polylines
 - `GET /v1/map/arrivals-normalized?stopIds=...&limit=500&cursor=...` - stop-indexed, pre-sorted arrivals for list rendering; cursor pagination via `meta.next_cursor`
@@ -60,6 +62,7 @@ Set:
 - `HEALTHCHECK_SECRET` (optional, for `GET /healthz` probes without a user token)
 - `REALTIME_TRIP_UPDATES_TABLE` (optional, default `trip_updates_current`) — Postgres table or view for live trip updates
 - `REALTIME_ALERTS_TABLE` (optional, default `service_alerts_current`) — Postgres table or view for service alerts
+- `VEHICLE_INGEST_KEY` (optional but recommended) — shared secret for `POST /v1/vehicle-position` via `X-Vehicle-Ingest-Key`
 
 If your ingest uses different table names, set these env vars or create SQL **views** with the default names that `SELECT` from your real tables.
 
@@ -73,6 +76,151 @@ go run ./cmd/server
 Then open Swagger (you need a Bearer token unless you use the public auth routes first):
 
 - `http://localhost:8080/swagger`
+
+## Realtime vehicle client examples
+
+Ingest a GPS update (trusted caller):
+
+```bash
+curl -X POST "http://localhost:8080/v1/vehicle-position" \
+  -H "Content-Type: application/json" \
+  -H "X-Vehicle-Ingest-Key: ${VEHICLE_INGEST_KEY}" \
+  -d '{
+    "vehicle_id":"bus-42",
+    "trip_id":"trip-123",
+    "route_id":"M6",
+    "lat":-26.2041,
+    "lon":28.0473,
+    "bearing":92.0,
+    "speed":13.5,
+    "updated_at":"2026-05-07T08:31:00Z"
+  }'
+```
+
+Initial snapshot (REST):
+
+```bash
+curl -H "Authorization: Bearer <access_token>" \
+  "http://localhost:8080/v1/map/vehicles"
+```
+
+React Native WebSocket subscribe/apply example:
+
+```ts
+type Vehicle = {
+  vehicle_id: string;
+  trip_id?: string;
+  route_id?: string;
+  route_short_name?: string;
+  route_long_name?: string;
+  route_inferred?: boolean;
+  lat: number;
+  lon: number;
+  bearing?: number;
+  speed?: number;
+  updated_at: string;
+  is_live: boolean;
+};
+
+type VehicleUpsertEvent = {
+  type: "vehicle.upsert";
+  ts: string;
+  vehicle: Vehicle;
+};
+
+const vehiclesById = new Map<string, Vehicle>();
+
+export function connectVehicleLive(token: string, onChange: (rows: Vehicle[]) => void) {
+  const ws = new WebSocket("wss://gtfs-mobile-api-production.up.railway.app/v1/map/vehicles/live", undefined, {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  ws.onmessage = (e) => {
+    const msg = JSON.parse(e.data) as VehicleUpsertEvent;
+    if (msg.type !== "vehicle.upsert") return;
+    vehiclesById.set(msg.vehicle.vehicle_id, msg.vehicle);
+    onChange(Array.from(vehiclesById.values()));
+  };
+
+  ws.onerror = () => ws.close();
+  return () => ws.close();
+}
+```
+
+React Native WebSocket with reconnect/backoff (production-safe):
+
+```ts
+type Vehicle = {
+  vehicle_id: string;
+  trip_id?: string;
+  route_id?: string;
+  route_short_name?: string;
+  route_long_name?: string;
+  route_inferred?: boolean;
+  lat: number;
+  lon: number;
+  bearing?: number;
+  speed?: number;
+  updated_at: string;
+  is_live: boolean;
+};
+
+type VehicleUpsertEvent = {
+  type: "vehicle.upsert";
+  ts: string;
+  vehicle: Vehicle;
+};
+
+export function startVehicleLiveFeed(token: string, onChange: (rows: Vehicle[]) => void) {
+  const vehiclesById = new Map<string, Vehicle>();
+  let ws: WebSocket | null = null;
+  let stopped = false;
+  let attempt = 0;
+  let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const scheduleReconnect = () => {
+    if (stopped) return;
+    const delayMs = Math.min(30_000, 1_000 * Math.pow(2, attempt)); // 1s,2s,4s...30s cap
+    attempt += 1;
+    retryTimer = setTimeout(connect, delayMs);
+  };
+
+  const connect = () => {
+    if (stopped) return;
+    ws = new WebSocket("wss://gtfs-mobile-api-production.up.railway.app/v1/map/vehicles/live", undefined, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+
+    ws.onopen = () => {
+      attempt = 0; // reset backoff after successful connect
+    };
+
+    ws.onmessage = (e) => {
+      const msg = JSON.parse(e.data) as VehicleUpsertEvent;
+      if (msg.type !== "vehicle.upsert") return;
+      vehiclesById.set(msg.vehicle.vehicle_id, msg.vehicle);
+      onChange(Array.from(vehiclesById.values()));
+    };
+
+    ws.onerror = () => {
+      ws?.close();
+    };
+
+    ws.onclose = () => {
+      ws = null;
+      scheduleReconnect();
+    };
+  };
+
+  connect();
+
+  return () => {
+    stopped = true;
+    if (retryTimer) clearTimeout(retryTimer);
+    ws?.close();
+  };
+}
+```
 
 ## Recommended SQL indexes
 

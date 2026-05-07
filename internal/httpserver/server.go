@@ -67,6 +67,7 @@ type Server struct {
 	cache    *cache.TTLCache
 	snapshot *snapshot.Snapshot
 	auth     *supabaseauth.Client
+	live     *vehicleLiveHub
 }
 
 func New(cfg config.Config, repo *repository.Repository, snap *snapshot.Snapshot, auth *supabaseauth.Client) *Server {
@@ -76,6 +77,7 @@ func New(cfg config.Config, repo *repository.Repository, snap *snapshot.Snapshot
 		cache:    cache.New(2 * time.Minute),
 		snapshot: snap,
 		auth:     auth,
+		live:     newVehicleLiveHub(),
 	}
 }
 
@@ -134,6 +136,8 @@ func (s *Server) Router() http.Handler {
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
+	mux.HandleFunc("GET /v1/map/vehicles/live", s.handleVehiclesLive)
+	mux.HandleFunc("POST /v1/vehicle-position", s.handleVehiclePositionIngest)
 	mux.HandleFunc("GET /v1/map/routes-with-live-vehicles", s.handleRoutesWithLiveVehicles)
 	mux.Handle("GET /v1/realtime/trip-updates", dynamicCache(http.HandlerFunc(s.handleRealtimeTripUpdates)))
 	mux.Handle("GET /v1/realtime/alerts", dynamicCache(http.HandlerFunc(s.handleRealtimeAlerts)))
@@ -2196,6 +2200,10 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		if path == "/v1/vehicle-position" && r.Method == http.MethodPost && s.vehicleIngestAuthorized(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		if _, err := s.requireUserID(r.Context(), r); err != nil {
 			httpError(w, http.StatusUnauthorized, err.Error())
@@ -2238,6 +2246,18 @@ func (s *Server) healthcheckAuthorized(r *http.Request) bool {
 		return false
 	}
 	got := strings.TrimSpace(r.Header.Get("X-Healthcheck-Secret"))
+	if got == "" {
+		return false
+	}
+	return subtle.ConstantTimeCompare([]byte(got), []byte(secret)) == 1
+}
+
+func (s *Server) vehicleIngestAuthorized(r *http.Request) bool {
+	secret := strings.TrimSpace(s.cfg.VehicleIngestKey)
+	if secret == "" {
+		return false
+	}
+	got := strings.TrimSpace(r.Header.Get("X-Vehicle-Ingest-Key"))
 	if got == "" {
 		return false
 	}

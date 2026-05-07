@@ -1419,7 +1419,9 @@ SELECT
 	x.lat,
 	x.lon,
 	x.bearing,
-	x.speed
+	x.speed,
+	x.updated_at,
+	true AS is_live
 FROM (
 	SELECT
 		v.vehicle_id,
@@ -1432,10 +1434,13 @@ FROM (
 		COALESCE(v.latitude, 0) AS lat,
 		COALESCE(v.longitude, 0) AS lon,
 		v.bearing,
-		v.speed
+		v.speed,
+		COALESCE(v.updated_at, NOW()) AS updated_at
 	FROM vehicle_positions_current v
 	LEFT JOIN trips t ON t.trip_id = v.trip_id
-	WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
+	WHERE v.latitude IS NOT NULL
+	  AND v.longitude IS NOT NULL
+	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
 ) x
 LEFT JOIN routes r ON r.route_id = x.route_id AND x.route_id <> ''
 `
@@ -1448,12 +1453,36 @@ LEFT JOIN routes r ON r.route_id = x.route_id AND x.route_id <> ''
 	out := make([]models.Vehicle, 0, 64)
 	for rows.Next() {
 		var v models.Vehicle
-		if err = rows.Scan(&v.VehicleID, &v.TripID, &v.RouteID, &v.ShortName, &v.LongName, &v.Lat, &v.Lon, &v.Bearing, &v.Speed); err != nil {
+		if err = rows.Scan(&v.VehicleID, &v.TripID, &v.RouteID, &v.ShortName, &v.LongName, &v.Lat, &v.Lon, &v.Bearing, &v.Speed, &v.UpdatedAt, &v.IsLive); err != nil {
 			return nil, fmt.Errorf("scan vehicle: %w", err)
 		}
 		out = append(out, v)
 	}
 	return out, rows.Err()
+}
+
+// UpsertVehiclePosition writes a latest GPS row by vehicle_id and refreshes updated_at.
+func (r *Repository) UpsertVehiclePosition(ctx context.Context, v models.Vehicle) error {
+	const q = `
+INSERT INTO vehicle_positions_current (
+	vehicle_id, trip_id, route_id, latitude, longitude, bearing, speed, updated_at
+)
+VALUES ($1, NULLIF($2,''), NULLIF($3,''), $4, $5, $6, $7, COALESCE($8, NOW()))
+ON CONFLICT (vehicle_id) DO UPDATE
+SET
+	trip_id = EXCLUDED.trip_id,
+	route_id = EXCLUDED.route_id,
+	latitude = EXCLUDED.latitude,
+	longitude = EXCLUDED.longitude,
+	bearing = EXCLUDED.bearing,
+	speed = EXCLUDED.speed,
+	updated_at = EXCLUDED.updated_at
+`
+	_, err := r.pool.Exec(ctx, q, v.VehicleID, v.TripID, v.RouteID, v.Lat, v.Lon, v.Bearing, v.Speed, v.UpdatedAt)
+	if err != nil {
+		return fmt.Errorf("upsert vehicle position: %w", err)
+	}
+	return nil
 }
 
 type routeDisplayName struct {
@@ -1574,7 +1603,9 @@ WITH resolved AS (
 		) AS route_id
 	FROM vehicle_positions_current v
 	LEFT JOIN trips t ON t.trip_id = v.trip_id
-	WHERE v.latitude IS NOT NULL AND v.longitude IS NOT NULL
+WHERE v.latitude IS NOT NULL
+  AND v.longitude IS NOT NULL
+  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
 )
 `
 	var out models.RoutesWithLiveVehiclesPayload
@@ -1648,6 +1679,7 @@ WITH unassigned AS (
 	LEFT JOIN trips t ON t.trip_id = v.trip_id
 	WHERE v.latitude IS NOT NULL
 	  AND v.longitude IS NOT NULL
+	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
 	  AND COALESCE(
 			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
 			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
