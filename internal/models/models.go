@@ -231,6 +231,35 @@ type ArrivalsNextPayload struct {
 	Arrivals map[string]StopArrivalLite `json:"arrivals"`
 }
 
+type UpcomingStopETA struct {
+	StopID        string     `json:"stop_id"`
+	StopName      string     `json:"stop_name,omitempty"`
+	Sequence      int        `json:"sequence"`
+	ScheduledTime time.Time  `json:"scheduled_time"`
+	EstimatedTime *time.Time `json:"estimated_time,omitempty"`
+	ETAMinutes    int        `json:"eta_minutes"`
+	IsRealtime    bool       `json:"is_realtime"`
+}
+
+type TripLivePayload struct {
+	VehicleID      string            `json:"vehicle_id,omitempty"`
+	TripID         string            `json:"trip_id"`
+	RouteID        string            `json:"route_id,omitempty"`
+	RouteShortName string            `json:"route_short_name,omitempty"`
+	RouteLongName  string            `json:"route_long_name,omitempty"`
+	DirectionID    string            `json:"direction_id,omitempty"`
+	Headsign       string            `json:"headsign,omitempty"`
+	Timestamp      *time.Time        `json:"timestamp,omitempty"`
+	Lat            *float64          `json:"lat,omitempty"`
+	Lon            *float64          `json:"lon,omitempty"`
+	Bearing        *float64          `json:"bearing,omitempty"`
+	DelaySeconds   *int              `json:"delay_seconds,omitempty"`
+	NextStopID     string            `json:"next_stop_id,omitempty"`
+	NextStopName   string            `json:"next_stop_name,omitempty"`
+	UpcomingStops  []UpcomingStopETA `json:"upcoming_stops"`
+	UpdatedAt      *time.Time        `json:"updated_at,omitempty"`
+}
+
 type Trip struct {
 	TripID       string `json:"trip_id"`
 	RouteID      string `json:"route_id,omitempty"`

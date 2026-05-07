@@ -21,6 +21,7 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 ## Endpoints
 
 - `GET /v1/map/vehicles` - active vehicles; canonical `route_id` (realtime row or `trips.route_id`), plus `route_short_name` / `route_long_name` from static `routes` when the route exists
+- `GET /v1/map/trip-live?tripId=...` (or `vehicleId=...`) - trip snapshot for detail screen with `upcoming_stops[]` (`scheduled_time`, nullable `estimated_time`, `eta_minutes`, `is_realtime`)
 - `GET /v1/map/vehicles/live` - WebSocket stream of `vehicle.upsert` events (initial snapshot + incremental updates)
 - `POST /v1/vehicle-position` - trusted ingest endpoint to upsert GPS and push live updates to WebSocket clients
 - `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`

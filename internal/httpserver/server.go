@@ -138,6 +138,7 @@ func (s *Server) Router() http.Handler {
 
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
+	mux.HandleFunc("GET /v1/map/trip-live", s.handleTripLive)
 	mux.HandleFunc("GET /v1/map/vehicles/live", s.handleVehiclesLive)
 	mux.HandleFunc("POST /v1/vehicle-position", s.handleVehiclePositionIngest)
 	mux.HandleFunc("GET /v1/map/routes-with-live-vehicles", s.handleRoutesWithLiveVehicles)
@@ -1855,6 +1856,69 @@ func (s *Server) handleRoutesWithLiveVehicles(w http.ResponseWriter, r *http.Req
 		Status: status,
 		Data:   payload,
 		Meta:   &models.Meta{Total: len(payload.Routes)},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, vehiclesCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) handleTripLive(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	tripID := strings.TrimSpace(q.Get("tripId"))
+	vehicleID := strings.TrimSpace(q.Get("vehicleId"))
+	if tripID == "" && vehicleID == "" {
+		httpError(w, http.StatusBadRequest, "tripId or vehicleId is required")
+		return
+	}
+	if tripID == "" {
+		var err error
+		tripID, err = s.repo.ResolveTripIDForVehicle(ctx, vehicleID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpError(w, http.StatusNotFound, "vehicle has no active trip")
+			return
+		}
+		if err != nil {
+			log.Printf("resolve trip from vehicle: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to resolve trip")
+			return
+		}
+	}
+	limit := clamp(parseIntOr(q.Get("limit"), 12), 1, 50)
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	cacheKey := "trip_live:" + tripID + ":" + strconv.Itoa(limit)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	payload, err := s.repo.GetTripLiveSnapshot(ctx, tripID, time.Now(), limit)
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpError(w, http.StatusNotFound, "trip not found")
+		return
+	}
+	if err != nil {
+		log.Printf("trip live: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load trip live data")
+		return
+	}
+	if vehicleID != "" && payload.VehicleID == "" {
+		payload.VehicleID = vehicleID
+	}
+
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   &models.Meta{Total: len(payload.UpcomingStops), Limit: limit},
 	}
 	s.cache.SetWithTTL(cacheKey, resp, vehiclesCacheTTL)
 	writeJSON(w, http.StatusOK, resp)

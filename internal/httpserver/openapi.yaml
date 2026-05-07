@@ -897,6 +897,36 @@ paths:
         "101":
           description: Switching Protocols
 
+  /v1/map/trip-live:
+    get:
+      tags: [Realtime]
+      summary: Live trip snapshot with upcoming stops ETA
+      description: |
+        Returns route/trip metadata and upcoming stops with ETA-friendly fields.
+        Provide either `tripId` or `vehicleId`. If realtime delays are missing, rows still return
+        schedule-based ETA with `estimated_time` null and `is_realtime=false`.
+      parameters:
+        - in: query
+          name: tripId
+          schema: { type: string }
+        - in: query
+          name: vehicleId
+          schema: { type: string }
+        - in: query
+          name: limit
+          description: Max upcoming stops returned (default 12, max 50)
+          schema: { type: integer, minimum: 1, maximum: 50, default: 12 }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TripLiveResponse" }
+        "400":
+          description: Missing tripId/vehicleId
+        "404":
+          description: Trip or vehicle mapping not found
+
   /v1/vehicle-position:
     post:
       tags: [Realtime]
@@ -1714,6 +1744,48 @@ components:
       properties:
         status: { $ref: "#/components/schemas/APIStatus" }
         data: { $ref: "#/components/schemas/ArrivalsNextPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    UpcomingStopETA:
+      type: object
+      required: [stop_id, sequence, scheduled_time, eta_minutes, is_realtime]
+      properties:
+        stop_id: { type: string }
+        stop_name: { type: string }
+        sequence: { type: integer }
+        scheduled_time: { type: string, format: date-time }
+        estimated_time: { type: string, format: date-time, nullable: true }
+        eta_minutes: { type: integer, minimum: 0 }
+        is_realtime: { type: boolean }
+
+    TripLivePayload:
+      type: object
+      required: [trip_id, upcoming_stops]
+      properties:
+        vehicle_id: { type: string }
+        trip_id: { type: string }
+        route_id: { type: string }
+        route_short_name: { type: string }
+        route_long_name: { type: string }
+        direction_id: { type: string }
+        headsign: { type: string }
+        timestamp: { type: string, format: date-time, nullable: true }
+        lat: { type: number, nullable: true }
+        lon: { type: number, nullable: true }
+        bearing: { type: number, nullable: true }
+        delay_seconds: { type: integer, nullable: true }
+        next_stop_id: { type: string }
+        next_stop_name: { type: string }
+        upcoming_stops:
+          type: array
+          items: { $ref: "#/components/schemas/UpcomingStopETA" }
+        updated_at: { type: string, format: date-time, nullable: true }
+
+    TripLiveResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/TripLivePayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     VehiclesResponse:

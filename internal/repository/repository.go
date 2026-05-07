@@ -1084,6 +1084,180 @@ ORDER BY st.stop_sequence
 	return out, rows.Err()
 }
 
+// ResolveTripIDForVehicle returns latest trip_id for a vehicle row.
+func (r *Repository) ResolveTripIDForVehicle(ctx context.Context, vehicleID string) (string, error) {
+	const q = `
+SELECT COALESCE(v.trip_id, '')
+FROM vehicle_positions_current v
+WHERE v.vehicle_id = $1
+ORDER BY COALESCE(v.updated_at, NOW()) DESC
+LIMIT 1
+`
+	var tripID string
+	if err := r.pool.QueryRow(ctx, q, vehicleID).Scan(&tripID); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(tripID) == "" {
+		return "", pgx.ErrNoRows
+	}
+	return tripID, nil
+}
+
+// GetTripLiveSnapshot returns route/trip metadata + upcoming stops ETA rows for one trip.
+func (r *Repository) GetTripLiveSnapshot(ctx context.Context, tripID string, at time.Time, limit int) (*models.TripLivePayload, error) {
+	if limit <= 0 {
+		limit = 12
+	}
+	if limit > 50 {
+		limit = 50
+	}
+
+	const qMeta = `
+SELECT
+	t.trip_id,
+	COALESCE(t.route_id, ''),
+	COALESCE(r.route_short_name, ''),
+	COALESCE(r.route_long_name, ''),
+	COALESCE(t.direction_id, ''),
+	COALESCE(t.trip_headsign, ''),
+	v.vehicle_id,
+	v.latitude,
+	v.longitude,
+	v.bearing,
+	COALESCE(v.updated_at, NOW())
+FROM trips t
+LEFT JOIN routes r ON r.route_id = t.route_id
+LEFT JOIN LATERAL (
+	SELECT vehicle_id, latitude, longitude, bearing, updated_at
+	FROM vehicle_positions_current
+	WHERE trip_id = t.trip_id
+	  AND latitude IS NOT NULL
+	  AND longitude IS NOT NULL
+	ORDER BY COALESCE(updated_at, NOW()) DESC
+	LIMIT 1
+) v ON true
+WHERE t.trip_id = $1
+`
+	out := &models.TripLivePayload{TripID: tripID, UpcomingStops: make([]models.UpcomingStopETA, 0, limit)}
+	var (
+		vehicleID sql.NullString
+		lat, lon  sql.NullFloat64
+		bearing   sql.NullFloat64
+		updated   time.Time
+	)
+	if err := r.pool.QueryRow(ctx, qMeta, tripID).Scan(
+		&out.TripID, &out.RouteID, &out.RouteShortName, &out.RouteLongName, &out.DirectionID, &out.Headsign,
+		&vehicleID, &lat, &lon, &bearing, &updated,
+	); err != nil {
+		return nil, err
+	}
+	if vehicleID.Valid {
+		out.VehicleID = vehicleID.String
+	}
+	if lat.Valid {
+		v := lat.Float64
+		out.Lat = &v
+	}
+	if lon.Valid {
+		v := lon.Float64
+		out.Lon = &v
+	}
+	if bearing.Valid {
+		v := bearing.Float64
+		out.Bearing = &v
+	}
+	out.Timestamp = &updated
+	out.UpdatedAt = &updated
+
+	const qStops = `
+WITH at_ts AS (
+	SELECT $2::timestamptz AS at
+),
+candidate_dates AS (
+	SELECT (at::date) AS d FROM at_ts
+	UNION ALL
+	SELECT (at::date - INTERVAL '1 day')::date FROM at_ts
+),
+expanded AS (
+	SELECT
+		st.stop_id,
+		COALESCE(s.stop_name, '') AS stop_name,
+		st.stop_sequence,
+		(cd.d::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time,
+		rt.arrival_delay
+	FROM stop_times st
+	JOIN candidate_dates cd ON true
+	LEFT JOIN stops s ON s.stop_id = st.stop_id
+	LEFT JOIN LATERAL (
+		SELECT rt_inner.arrival_delay
+		FROM trip_update_stop_times_current rt_inner
+		WHERE rt_inner.trip_id = st.trip_id AND rt_inner.stop_id = st.stop_id
+		LIMIT 1
+	) rt ON true
+	WHERE st.trip_id = $1
+),
+future AS (
+	SELECT *
+	FROM expanded
+	WHERE scheduled_time >= (SELECT at FROM at_ts)
+	ORDER BY scheduled_time, stop_sequence
+	LIMIT $3
+)
+SELECT
+	stop_id,
+	stop_name,
+	stop_sequence,
+	scheduled_time,
+	CASE WHEN arrival_delay IS NULL THEN NULL ELSE scheduled_time + (arrival_delay || ' seconds')::interval END AS estimated_time,
+	arrival_delay
+FROM future
+ORDER BY scheduled_time, stop_sequence
+`
+	rows, err := r.pool.Query(ctx, qStops, tripID, at, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query trip live stops: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			u       models.UpcomingStopETA
+			est     sql.NullTime
+			delay   sql.NullInt64
+			baseETA time.Time
+		)
+		if err = rows.Scan(&u.StopID, &u.StopName, &u.Sequence, &u.ScheduledTime, &est, &delay); err != nil {
+			return nil, fmt.Errorf("scan trip live stop: %w", err)
+		}
+		if est.Valid {
+			t := est.Time
+			u.EstimatedTime = &t
+			u.IsRealtime = true
+			baseETA = t
+		} else {
+			u.IsRealtime = false
+			baseETA = u.ScheduledTime
+		}
+		if delay.Valid {
+			d := int(delay.Int64)
+			out.DelaySeconds = &d
+		}
+		u.ETAMinutes = int(time.Until(baseETA).Minutes())
+		if u.ETAMinutes < 0 {
+			u.ETAMinutes = 0
+		}
+		out.UpcomingStops = append(out.UpcomingStops, u)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(out.UpcomingStops) > 0 {
+		out.NextStopID = out.UpcomingStops[0].StopID
+		out.NextStopName = out.UpcomingStops[0].StopName
+	}
+	return out, nil
+}
+
 func (r *Repository) ListTrips(ctx context.Context, routeID, serviceDate string, limit int) ([]models.Trip, error) {
 	var (
 		filters []string
