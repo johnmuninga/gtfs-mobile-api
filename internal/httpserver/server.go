@@ -1201,9 +1201,11 @@ func (s *Server) handleRouteStops(w http.ResponseWriter, r *http.Request) {
 			}
 			payload.StopIDs = append(payload.StopIDs, id)
 			payload.Stops[id] = models.StopPointLite{
-				StopID: id,
-				Lat:    stops[i].Lat,
-				Lon:    stops[i].Lon,
+				StopID:   id,
+				StopName: strings.TrimSpace(stops[i].StopName),
+				StopCode: strings.TrimSpace(stops[i].StopCode),
+				Lat:      stops[i].Lat,
+				Lon:      stops[i].Lon,
 			}
 		}
 		resp := models.ResponseEnvelope{

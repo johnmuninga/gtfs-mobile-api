@@ -99,11 +99,13 @@ type StopSummary struct {
 	Lon        float64 `json:"lon"`
 }
 
-// StopPointLite is a minimal stop marker payload (no names/codes).
+// StopPointLite is a compact stop payload for route stop lists/maps.
 type StopPointLite struct {
-	StopID string  `json:"stop_id"`
-	Lat    float64 `json:"lat"`
-	Lon    float64 `json:"lon"`
+	StopID   string  `json:"stop_id"`
+	StopName string  `json:"stop_name,omitempty"`
+	StopCode string  `json:"stop_code,omitempty"`
+	Lat      float64 `json:"lat"`
+	Lon      float64 `json:"lon"`
 }
 
 // RouteStopsLitePayload is an ordered stop_id list + dictionary for O(1) lookups.

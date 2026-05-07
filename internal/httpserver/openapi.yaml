@@ -356,7 +356,7 @@ paths:
       description: |
         Default response is an array of stop summaries.
         Set `lite=1` to return a compact payload:
-        `{ stops: { [stop_id]: { stop_id, lat, lon } }, stop_ids: [] }`.
+        `{ stops: { [stop_id]: { stop_id, stop_name, stop_code, lat, lon } }, stop_ids: [] }`.
       parameters:
         - in: path
           name: routeId
@@ -1400,6 +1400,8 @@ components:
       required: [stop_id, lat, lon]
       properties:
         stop_id: { type: string }
+        stop_name: { type: string }
+        stop_code: { type: string }
         lat: { type: number, format: double }
         lon: { type: number, format: double }
 
