@@ -346,6 +346,27 @@ type CalendarDayPayload struct {
 	FeedCalendarWindow *FeedCalendarWindow  `json:"feed_calendar_window,omitempty"` // when include=window
 }
 
+// TimetableTripLite is one lightweight trip row for timetable pickers.
+type TimetableTripLite struct {
+	TripID      string `json:"trip_id"`
+	DirectionID string `json:"direction_id,omitempty"`
+	Headsign    string `json:"headsign,omitempty"`
+	ShortName   string `json:"short_name,omitempty"`
+	FirstStopID string `json:"first_stop_id,omitempty"`
+	FirstTime   string `json:"first_time,omitempty"` // HH:MM:SS (GTFS local)
+	LastStopID  string `json:"last_stop_id,omitempty"`
+	LastTime    string `json:"last_time,omitempty"` // HH:MM:SS (GTFS local)
+	StopCount   int    `json:"stop_count"`
+}
+
+// CalendarTimetableLitePayload is a compact single-call payload for calendar route timetable browsing.
+type CalendarTimetableLitePayload struct {
+	Date      string              `json:"date"` // YYYY-MM-DD
+	RouteID   string              `json:"route_id"`
+	Direction string              `json:"direction_id,omitempty"`
+	Trips     []TimetableTripLite `json:"trips"`
+}
+
 // FeedCalendarWindow is min/max dates across calendar + calendar_dates (static GTFS coverage).
 type FeedCalendarWindow struct {
 	MinDate string `json:"min_date"` // YYYY-MM-DD

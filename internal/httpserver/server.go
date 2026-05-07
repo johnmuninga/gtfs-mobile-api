@@ -118,6 +118,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/gtfs/calendar/service", staticCache(http.HandlerFunc(s.handleServiceCalendar)))
 	mux.Handle("GET /v1/gtfs/calendar/exceptions", staticCache(http.HandlerFunc(s.handleCalendarExceptions)))
 	mux.Handle("GET /v1/gtfs/calendar/day", staticCache(http.HandlerFunc(s.handleCalendarDay)))
+	mux.Handle("GET /v1/gtfs/calendar/timetable-lite", staticCache(http.HandlerFunc(s.handleCalendarTimetableLite)))
 	mux.Handle("GET /v1/gtfs/calendar/{serviceId}", staticCache(http.HandlerFunc(s.handleGetCalendarService)))
 	mux.Handle("GET /v1/gtfs/calendar", staticCache(http.HandlerFunc(s.handleListCalendar)))
 
@@ -1653,6 +1654,74 @@ func (s *Server) handleCalendarDay(w http.ResponseWriter, r *http.Request) {
 		Data:   payload,
 		Meta:   &models.Meta{Total: len(services), ServiceDate: date},
 	})
+}
+
+// handleCalendarTimetableLite provides a compact one-call route timetable list for a date.
+// Query: date=YYYY-MM-DD&routeId=R1[&directionId=0][&limit=80][&cursor=...]
+func (s *Server) handleCalendarTimetableLite(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	date := strings.TrimSpace(q.Get("date"))
+	if date == "" {
+		date = time.Now().Format("2006-01-02")
+	}
+	if _, err := time.Parse("2006-01-02", date); err != nil {
+		httpError(w, http.StatusBadRequest, "invalid date (use YYYY-MM-DD)")
+		return
+	}
+	routeID := strings.TrimSpace(q.Get("routeId"))
+	if routeID == "" {
+		httpError(w, http.StatusBadRequest, "routeId is required")
+		return
+	}
+	directionID := strings.TrimSpace(q.Get("directionId"))
+	limit := clamp(parseIntOr(q.Get("limit"), 80), 1, 500)
+	offset, bad := parseCursorOffset(q.Get("cursor"))
+	if bad {
+		httpError(w, http.StatusBadRequest, "invalid cursor")
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	cacheKey := "calendar_timetable_lite:" + date + "|" + routeID + "|" + directionID + "|" + strconv.Itoa(limit) + "|" + strconv.Itoa(offset)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	trips, err := s.repo.ListTimetableTripsLite(ctx, routeID, date, directionID, limit, offset)
+	if err != nil {
+		log.Printf("calendar timetable lite: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to fetch timetable")
+		return
+	}
+	payload := models.CalendarTimetableLitePayload{
+		Date:      date,
+		RouteID:   routeID,
+		Direction: directionID,
+		Trips:     trips,
+	}
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta: &models.Meta{
+			Total:       len(trips),
+			Limit:       limit,
+			ServiceDate: date,
+			NextCursor:  nextCursorForCount(len(trips), offset, limit),
+		},
+	}
+	s.cache.SetWithTTL(cacheKey, resp, 45*time.Second)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleFeedActive(w http.ResponseWriter, r *http.Request) {

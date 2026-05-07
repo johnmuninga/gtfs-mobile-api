@@ -1330,6 +1330,110 @@ JOIN active_services a ON a.service_id = t.service_id
 	return out, rows.Err()
 }
 
+// ListTimetableTripsLite returns compact trip rows for a route on a service date.
+func (r *Repository) ListTimetableTripsLite(ctx context.Context, routeID, serviceDate, directionID string, limit, offset int) ([]models.TimetableTripLite, error) {
+	if limit <= 0 {
+		limit = 80
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	args := []any{serviceDate, routeID}
+	fDir := ""
+	if strings.TrimSpace(directionID) != "" {
+		args = append(args, directionID)
+		fDir = fmt.Sprintf("AND COALESCE(t.direction_id, '') = $%d", len(args))
+	}
+	args = append(args, limit, offset)
+	limitIdx := len(args) - 1
+	offsetIdx := len(args)
+	q := fmt.Sprintf(`
+WITH active_services AS (
+	SELECT c.service_id
+	FROM calendar c
+	WHERE to_date(c.start_date, 'YYYYMMDD') <= $1::date
+	  AND to_date(c.end_date,   'YYYYMMDD') >= $1::date
+	  AND CASE EXTRACT(ISODOW FROM $1::date)
+			WHEN 1 THEN c.monday
+			WHEN 2 THEN c.tuesday
+			WHEN 3 THEN c.wednesday
+			WHEN 4 THEN c.thursday
+			WHEN 5 THEN c.friday
+			WHEN 6 THEN c.saturday
+			WHEN 7 THEN c.sunday
+		 END = '1'
+	  AND NOT EXISTS (
+		SELECT 1 FROM calendar_dates ex
+		WHERE ex.service_id = c.service_id
+		  AND ex.date = to_char($1::date, 'YYYYMMDD')
+		  AND ex.exception_type = '2'
+	  )
+	UNION
+	SELECT ex.service_id
+	FROM calendar_dates ex
+	WHERE ex.date = to_char($1::date, 'YYYYMMDD')
+	  AND ex.exception_type = '1'
+),
+scoped AS (
+	SELECT
+		t.trip_id,
+		COALESCE(t.direction_id, '') AS direction_id,
+		COALESCE(t.trip_headsign, '') AS headsign,
+		COALESCE(t.trip_short_name, '') AS short_name
+	FROM trips t
+	JOIN active_services a ON a.service_id = t.service_id
+	WHERE t.route_id = $2
+	%s
+	ORDER BY COALESCE(t.direction_id, ''), COALESCE(t.trip_headsign, ''), t.trip_id
+	LIMIT $%d OFFSET $%d
+),
+first_last AS (
+	SELECT
+		s.trip_id,
+		MIN(st.stop_sequence) AS first_seq,
+		MAX(st.stop_sequence) AS last_seq,
+		COUNT(*)::int AS stop_count
+	FROM scoped s
+	JOIN stop_times st ON st.trip_id = s.trip_id
+	GROUP BY s.trip_id
+)
+SELECT
+	s.trip_id,
+	s.direction_id,
+	s.headsign,
+	s.short_name,
+	COALESCE(stf.stop_id, ''),
+	COALESCE(stf.departure_time, stf.arrival_time, ''),
+	COALESCE(stl.stop_id, ''),
+	COALESCE(stl.departure_time, stl.arrival_time, ''),
+	COALESCE(fl.stop_count, 0)
+FROM scoped s
+LEFT JOIN first_last fl ON fl.trip_id = s.trip_id
+LEFT JOIN stop_times stf ON stf.trip_id = s.trip_id AND stf.stop_sequence = fl.first_seq
+LEFT JOIN stop_times stl ON stl.trip_id = s.trip_id AND stl.stop_sequence = fl.last_seq
+ORDER BY s.direction_id, s.headsign, s.trip_id
+`, fDir, limitIdx, offsetIdx)
+
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query timetable trips lite: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.TimetableTripLite, 0, limit)
+	for rows.Next() {
+		var t models.TimetableTripLite
+		if err = rows.Scan(&t.TripID, &t.DirectionID, &t.Headsign, &t.ShortName, &t.FirstStopID, &t.FirstTime, &t.LastStopID, &t.LastTime, &t.StopCount); err != nil {
+			return nil, fmt.Errorf("scan timetable trip lite: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ============================================================================
 // Calendar
 // ============================================================================

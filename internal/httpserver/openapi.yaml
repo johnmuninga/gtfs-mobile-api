@@ -535,6 +535,39 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CalendarDayResponse" }
+
+  /v1/gtfs/calendar/timetable-lite:
+    get:
+      tags: [Calendar]
+      summary: Compact route timetable for one date
+      description: |
+        Lightweight single-call payload for calendar/timetable screens.
+        Returns trip rows for a route on a specific date with first/last stop times and stop counts.
+      parameters:
+        - in: query
+          name: date
+          description: YYYY-MM-DD (defaults to today)
+          schema: { type: string, format: date }
+        - in: query
+          name: routeId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: directionId
+          schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 80 }
+        - in: query
+          name: cursor
+          description: Opaque cursor from previous response `meta.next_cursor`.
+          schema: { type: string }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarTimetableLiteResponse" }
         "400":
           content:
             application/json:
@@ -1317,6 +1350,38 @@ components:
           properties:
             min_date: { type: string, format: date }
             max_date: { type: string, format: date }
+
+    TimetableTripLite:
+      type: object
+      required: [trip_id, stop_count]
+      properties:
+        trip_id: { type: string }
+        direction_id: { type: string }
+        headsign: { type: string }
+        short_name: { type: string }
+        first_stop_id: { type: string }
+        first_time: { type: string }
+        last_stop_id: { type: string }
+        last_time: { type: string }
+        stop_count: { type: integer, minimum: 0 }
+
+    CalendarTimetableLitePayload:
+      type: object
+      required: [date, route_id, trips]
+      properties:
+        date: { type: string, format: date }
+        route_id: { type: string }
+        direction_id: { type: string }
+        trips:
+          type: array
+          items: { $ref: "#/components/schemas/TimetableTripLite" }
+
+    CalendarTimetableLiteResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/CalendarTimetableLitePayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
 
     CalendarDayResponse:
       type: object
