@@ -353,6 +353,10 @@ paths:
     get:
       tags: [Routes]
       summary: Stops served by a route
+      description: |
+        Default response is an array of stop summaries.
+        Set `lite=1` to return a compact payload:
+        `{ stops: { [stop_id]: { stop_id, lat, lon } }, stop_ids: [] }`.
       parameters:
         - in: path
           name: routeId
@@ -361,6 +365,10 @@ paths:
         - in: query
           name: directionId
           schema: { type: string, enum: ["0", "1"] }
+        - in: query
+          name: lite
+          description: If true/1, return compact stop dictionary and ordered ids.
+          schema: { type: string, enum: ["0", "1", "true", "false"] }
       responses:
         "200":
           description: OK
@@ -685,6 +693,57 @@ paths:
               schema: { $ref: "#/components/schemas/MapNormalizedResponse" }
         "400":
           description: Missing or invalid routeIds
+
+  /v1/map/stops-normalized:
+    get:
+      tags: [Map]
+      summary: Normalized nearby stops (stop_id-keyed + ordered ids)
+      description: |
+        Returns nearby stops in a mobile-friendly shape:
+        - `stops`: dictionary keyed by `stop_id`
+        - `stop_ids`: nearest-first order for rendering lists/markers
+        Supports cursor pagination via `meta.next_cursor`.
+      parameters:
+        - in: query
+          name: lat
+          required: true
+          schema: { type: number, format: double }
+        - in: query
+          name: lon
+          required: true
+          schema: { type: number, format: double }
+        - in: query
+          name: radius
+          description: Search radius in meters (default server config, max 50000)
+          schema: { type: integer, minimum: 1, maximum: 50000 }
+        - in: query
+          name: search
+          description: Optional name/code substring filter.
+          schema: { type: string }
+        - in: query
+          name: limit
+          description: Max stops per page (default 150, max 500)
+          schema: { type: integer, minimum: 1, maximum: 500, default: 150 }
+        - in: query
+          name: cursor
+          description: Opaque cursor from previous response `meta.next_cursor`.
+          schema: { type: string }
+        - in: query
+          name: routeIds
+          description: Optional comma-separated `route_id` values (max 25).
+          schema: { type: string }
+        - in: query
+          name: routeIdsKind
+          description: Use short_name when routeIds contains route numbers/names.
+          schema: { type: string, enum: [route_id, short_name, short] }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/StopsNormalizedResponse" }
+        "400":
+          description: Missing or invalid lat/lon/radius/cursor
 
   /v1/map/arrivals-normalized:
     get:
@@ -1336,6 +1395,25 @@ components:
           items: { $ref: "#/components/schemas/StopSummary" }
         meta: { $ref: "#/components/schemas/Meta" }
 
+    StopPointLite:
+      type: object
+      required: [stop_id, lat, lon]
+      properties:
+        stop_id: { type: string }
+        lat: { type: number, format: double }
+        lon: { type: number, format: double }
+
+    RouteStopsLitePayload:
+      type: object
+      required: [stops, stop_ids]
+      properties:
+        stops:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/StopPointLite" }
+        stop_ids:
+          type: array
+          items: { type: string }
+
     StopResponse:
       type: object
       properties:
@@ -1568,6 +1646,26 @@ components:
       properties:
         status: { $ref: "#/components/schemas/APIStatus" }
         data: { $ref: "#/components/schemas/MapNormalizedPayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    StopsNormalizedPayload:
+      type: object
+      required: [stops, stop_ids]
+      properties:
+        stops:
+          type: object
+          additionalProperties: { $ref: "#/components/schemas/StopSummary" }
+          description: Dictionary keyed by stop_id.
+        stop_ids:
+          type: array
+          description: Nearest-first stop_id order.
+          items: { type: string }
+
+    StopsNormalizedResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/StopsNormalizedPayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     StopArrivalLite:

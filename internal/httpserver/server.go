@@ -129,6 +129,8 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/map/routes-overlay", staticCache(http.HandlerFunc(s.handleMapRoutesOverlay)))
 	// Map: normalized dictionaries for high-volume RN rendering
 	mux.Handle("GET /v1/map/routes-normalized", staticCache(http.HandlerFunc(s.handleMapRoutesNormalized)))
+	// Map: normalized stops dictionary with ordered ids + cursor pagination
+	mux.Handle("GET /v1/map/stops-normalized", staticCache(http.HandlerFunc(s.handleMapStopsNormalized)))
 	// Map: normalized stop_id -> arrivals[] for flat list rendering
 	mux.Handle("GET /v1/map/arrivals-normalized", dynamicCache(http.HandlerFunc(s.handleArrivalsNormalized)))
 	// Map: one next arrival row per stop_id (lightweight badges/chips)
@@ -635,6 +637,100 @@ func (s *Server) handleMapRoutesNormalized(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+func (s *Server) handleMapStopsNormalized(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	hasLat, latErr := optionalFloat(q, "lat")
+	hasLon, lonErr := optionalFloat(q, "lon")
+	if latErr != nil || lonErr != nil || hasLat == nil || hasLon == nil {
+		httpError(w, http.StatusBadRequest, "lat and lon are required")
+		return
+	}
+	lat, lon := *hasLat, *hasLon
+
+	radius := s.cfg.NearbyDefaultRadiusMeters
+	if raw := q.Get("radius"); raw != "" {
+		v, err := strconv.Atoi(raw)
+		if err != nil || v <= 0 || v > 50_000 {
+			httpError(w, http.StatusBadRequest, "invalid radius (1–50000 meters)")
+			return
+		}
+		radius = v
+	}
+
+	offset, bad := parseCursorOffset(q.Get("cursor"))
+	if bad {
+		httpError(w, http.StatusBadRequest, "invalid cursor")
+		return
+	}
+	limit := clamp(parseIntOr(q.Get("limit"), defaultMapStops), 1, maxMapStops)
+	page := (offset / limit) + 1
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	filterRouteIDs := s.parseRouteIDsFromQuery(ctx, q)
+	params := repository.StopSearchParams{
+		Search:       strings.TrimSpace(q.Get("search")),
+		Lat:          &lat,
+		Lon:          &lon,
+		RadiusMeters: radius,
+		Limit:        limit,
+		Page:         page,
+		RouteIDs:     filterRouteIDs,
+	}
+
+	var (
+		stops []models.StopSummary
+		total int
+	)
+	if len(filterRouteIDs) > 0 {
+		// Route-filtered stops must hit DB (same behavior as /v1/map/static).
+		stops, total, err = s.repo.SearchStops(ctx, params)
+	} else if s.snapshot != nil && s.snapshot.Loaded() {
+		stops, total = s.snapshot.FilterStops(params.Search, params.Lat, params.Lon, params.RadiusMeters, params.Page, params.Limit)
+	} else {
+		stops, total, err = s.repo.SearchStops(ctx, params)
+	}
+	if err != nil {
+		log.Printf("map stops normalized: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load map stops")
+		return
+	}
+	models.EnrichStopSummariesForMap(stops)
+
+	payload := models.StopsNormalizedPayload{
+		Stops:   make(map[string]models.StopSummary, len(stops)),
+		StopIDs: make([]string, 0, len(stops)),
+	}
+	for i := range stops {
+		id := strings.TrimSpace(stops[i].StopID)
+		if id == "" {
+			continue
+		}
+		payload.Stops[id] = stops[i]
+		payload.StopIDs = append(payload.StopIDs, id)
+	}
+
+	hasNext := page*limit < total
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta: &models.Meta{
+			Total:      total,
+			Limit:      limit,
+			Page:       page,
+			HasNext:    hasNext,
+			NextCursor: nextCursorForCount(len(payload.StopIDs), offset, limit),
+		},
+	})
+}
+
 func (s *Server) handleArrivalsNormalized(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
@@ -1066,7 +1162,9 @@ func (s *Server) handleRouteStops(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "missing route id")
 		return
 	}
-	directionID := strings.TrimSpace(r.URL.Query().Get("directionId"))
+	q := r.URL.Query()
+	directionID := strings.TrimSpace(q.Get("directionId"))
+	lite := strings.EqualFold(strings.TrimSpace(q.Get("lite")), "true") || strings.TrimSpace(q.Get("lite")) == "1"
 
 	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
 	defer cancel()
@@ -1077,18 +1175,53 @@ func (s *Server) handleRouteStops(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	cacheKey := "route_stops:" + routeID + "|" + directionID + "|lite=" + strconv.FormatBool(lite)
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if hit, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, hit)
+			return
+		}
+	}
+
 	stops, err := s.repo.GetRouteStops(ctx, routeID, directionID)
 	if err != nil {
 		log.Printf("route stops: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to fetch route stops")
 		return
 	}
-
-	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+	if lite {
+		payload := models.RouteStopsLitePayload{
+			Stops:   make(map[string]models.StopPointLite, len(stops)),
+			StopIDs: make([]string, 0, len(stops)),
+		}
+		for i := range stops {
+			id := strings.TrimSpace(stops[i].StopID)
+			if id == "" {
+				continue
+			}
+			payload.StopIDs = append(payload.StopIDs, id)
+			payload.Stops[id] = models.StopPointLite{
+				StopID: id,
+				Lat:    stops[i].Lat,
+				Lon:    stops[i].Lon,
+			}
+		}
+		resp := models.ResponseEnvelope{
+			Status: status,
+			Data:   payload,
+			Meta:   &models.Meta{Total: len(payload.StopIDs)},
+		}
+		s.cache.SetWithTTL(cacheKey, resp, 60*time.Second)
+		writeJSON(w, http.StatusOK, resp)
+		return
+	}
+	resp := models.ResponseEnvelope{
 		Status: status,
 		Data:   stops,
 		Meta:   &models.Meta{Total: len(stops)},
-	})
+	}
+	s.cache.SetWithTTL(cacheKey, resp, 60*time.Second)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleRouteDirections(w http.ResponseWriter, r *http.Request) {

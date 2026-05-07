@@ -99,6 +99,19 @@ type StopSummary struct {
 	Lon        float64 `json:"lon"`
 }
 
+// StopPointLite is a minimal stop marker payload (no names/codes).
+type StopPointLite struct {
+	StopID string  `json:"stop_id"`
+	Lat    float64 `json:"lat"`
+	Lon    float64 `json:"lon"`
+}
+
+// RouteStopsLitePayload is an ordered stop_id list + dictionary for O(1) lookups.
+type RouteStopsLitePayload struct {
+	Stops   map[string]StopPointLite `json:"stops"`
+	StopIDs []string                 `json:"stop_ids"`
+}
+
 // EnrichStopSummariesForMap sets id and gtfs_stop_id from stop_id for map overlay consumers.
 func EnrichStopSummariesForMap(stops []StopSummary) {
 	for i := range stops {
@@ -186,6 +199,13 @@ type MapNormalizedPayload struct {
 	Stops           map[string]StopSummary  `json:"stops"`
 	Junctions       map[string][]string     `json:"junctions"`
 	RouteGeometries map[string]string       `json:"route_geometries"`
+}
+
+// StopsNormalizedPayload is a stop_id keyed structure for map/list clients.
+// StopIDs preserves order (nearest-first) while Stops provides O(1) lookup.
+type StopsNormalizedPayload struct {
+	Stops   map[string]StopSummary `json:"stops"`
+	StopIDs []string               `json:"stop_ids"`
 }
 
 // StopArrivalLite is a flat, pre-sorted row for mobile timetable rendering.

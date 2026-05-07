@@ -25,12 +25,14 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 - `POST /v1/vehicle-position` - trusted ingest endpoint to upsert GPS and push live updates to WebSocket clients
 - `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`
 - `GET /v1/map/routes-normalized?routeIds=...` - mobile-optimized relational map payload: `routes`/`stops` dictionaries, `junctions` (`route_id -> stop_id[]`), and `route_geometries` as encoded polylines
+- `GET /v1/map/stops-normalized?lat=...&lon=...&limit=...&cursor=...` - stop dictionary (`stops`) plus ordered `stop_ids` for low-overhead map/list rendering
 - `GET /v1/map/arrivals-normalized?stopIds=...&limit=500&cursor=...` - stop-indexed, pre-sorted arrivals for list rendering; cursor pagination via `meta.next_cursor`
 - `GET /v1/map/arrivals-next?stopIds=...` - one upcoming arrival per stop for lightweight map badges/chips
 - `GET /v1/gtfs/routes/{routeId}/shape-encoded` - map-optimized geometry as Google encoded polyline (smaller payload than raw point arrays)
 - `GET /v1/realtime/trip-updates?limit=500&cursor=...` - live trip rows from `REALTIME_TRIP_UPDATES_TABLE` (default `trip_updates_current`); cursor pagination via `meta.next_cursor`
 - `GET /v1/realtime/alerts?limit=500&cursor=...` - live alert rows from `REALTIME_ALERTS_TABLE` (default `service_alerts_current`); cursor pagination via `meta.next_cursor`
 - `GET /v1/routes` - route list from `routes`
+- `GET /v1/gtfs/routes/{routeId}/stops?directionId=0&lite=1` - compact stops payload (`stop_ids` + `stops` dictionary) for faster route-stop rendering
 - `GET /v1/stops/{id}/schedule` - next 5 departures, realtime fallback to static
 - `GET /v1/stops/nearby?lat={lat}&lon={lon}&radius_meters={r}` - nearby stop search
 - `GET /swagger` - Swagger UI
@@ -218,6 +220,72 @@ export function startVehicleLiveFeed(token: string, onChange: (rows: Vehicle[]) 
     stopped = true;
     if (retryTimer) clearTimeout(retryTimer);
     ws?.close();
+  };
+}
+```
+
+React Native helper for `GET /v1/map/stops-normalized`:
+
+```ts
+type StopSummary = {
+  stop_id: string;
+  id?: string;
+  gtfs_stop_id?: string;
+  stop_name?: string;
+  stop_code?: string;
+  lat: number;
+  lon: number;
+};
+
+type StopsNormalizedPayload = {
+  stops: Record<string, StopSummary>;
+  stop_ids: string[];
+};
+
+type StopsNormalizedResponse = {
+  status: { mode: "normal" | "static_only"; last_successful_sync?: string };
+  data: StopsNormalizedPayload;
+  meta?: { total?: number; limit?: number; next_cursor?: string };
+};
+
+export async function fetchStopsNormalized(params: {
+  baseUrl: string;
+  token: string;
+  lat: number;
+  lon: number;
+  radius?: number;
+  limit?: number;
+  cursor?: string;
+  search?: string;
+  routeIds?: string;
+  routeIdsKind?: "route_id" | "short_name" | "short";
+}) {
+  const qs = new URLSearchParams({
+    lat: String(params.lat),
+    lon: String(params.lon),
+    ...(params.radius ? { radius: String(params.radius) } : {}),
+    ...(params.limit ? { limit: String(params.limit) } : {}),
+    ...(params.cursor ? { cursor: params.cursor } : {}),
+    ...(params.search ? { search: params.search } : {}),
+    ...(params.routeIds ? { routeIds: params.routeIds } : {}),
+    ...(params.routeIdsKind ? { routeIdsKind: params.routeIdsKind } : {}),
+  });
+
+  const res = await fetch(`${params.baseUrl}/v1/map/stops-normalized?${qs.toString()}`, {
+    headers: { Authorization: `Bearer ${params.token}` },
+  });
+  if (!res.ok) throw new Error(`stops-normalized failed: ${res.status}`);
+  const json = (await res.json()) as StopsNormalizedResponse;
+
+  // Render-ready ordered list with O(1) dictionary retained for lookups.
+  const orderedStops = json.data.stop_ids
+    .map((id) => json.data.stops[id])
+    .filter(Boolean);
+
+  return {
+    byId: json.data.stops,
+    ordered: orderedStops,
+    nextCursor: json.meta?.next_cursor ?? "",
   };
 }
 ```
