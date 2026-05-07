@@ -543,6 +543,7 @@ paths:
       description: |
         Lightweight single-call payload for calendar/timetable screens.
         Returns trip rows for a route on a specific date with first/last stop times and stop counts.
+        If no active services exist for the date, falls back to static `trips + stop_times` for that route.
       parameters:
         - in: query
           name: date

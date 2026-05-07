@@ -1434,6 +1434,86 @@ ORDER BY s.direction_id, s.headsign, s.trip_id
 	return out, rows.Err()
 }
 
+// ListTimetableTripsLiteStatic returns compact trip rows without calendar/day filtering.
+// Use as fallback when a route has static stop_times but no active services for the requested date.
+func (r *Repository) ListTimetableTripsLiteStatic(ctx context.Context, routeID, directionID string, limit, offset int) ([]models.TimetableTripLite, error) {
+	if limit <= 0 {
+		limit = 80
+	}
+	if limit > 500 {
+		limit = 500
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	args := []any{routeID}
+	fDir := ""
+	if strings.TrimSpace(directionID) != "" {
+		args = append(args, directionID)
+		fDir = fmt.Sprintf("AND COALESCE(t.direction_id, '') = $%d", len(args))
+	}
+	args = append(args, limit, offset)
+	limitIdx := len(args) - 1
+	offsetIdx := len(args)
+
+	q := fmt.Sprintf(`
+WITH scoped AS (
+	SELECT
+		t.trip_id,
+		COALESCE(t.direction_id, '') AS direction_id,
+		COALESCE(t.trip_headsign, '') AS headsign,
+		COALESCE(t.trip_short_name, '') AS short_name
+	FROM trips t
+	WHERE t.route_id = $1
+	%s
+	ORDER BY COALESCE(t.direction_id, ''), COALESCE(t.trip_headsign, ''), t.trip_id
+	LIMIT $%d OFFSET $%d
+),
+first_last AS (
+	SELECT
+		s.trip_id,
+		MIN(st.stop_sequence) AS first_seq,
+		MAX(st.stop_sequence) AS last_seq,
+		COUNT(*)::int AS stop_count
+	FROM scoped s
+	JOIN stop_times st ON st.trip_id = s.trip_id
+	GROUP BY s.trip_id
+)
+SELECT
+	s.trip_id,
+	s.direction_id,
+	s.headsign,
+	s.short_name,
+	COALESCE(stf.stop_id, ''),
+	COALESCE(stf.departure_time, stf.arrival_time, ''),
+	COALESCE(stl.stop_id, ''),
+	COALESCE(stl.departure_time, stl.arrival_time, ''),
+	COALESCE(fl.stop_count, 0)
+FROM scoped s
+LEFT JOIN first_last fl ON fl.trip_id = s.trip_id
+LEFT JOIN stop_times stf ON stf.trip_id = s.trip_id AND stf.stop_sequence = fl.first_seq
+LEFT JOIN stop_times stl ON stl.trip_id = s.trip_id AND stl.stop_sequence = fl.last_seq
+ORDER BY s.direction_id, s.headsign, s.trip_id
+`, fDir, limitIdx, offsetIdx)
+
+	rows, err := r.pool.Query(ctx, q, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query timetable trips lite static: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]models.TimetableTripLite, 0, limit)
+	for rows.Next() {
+		var t models.TimetableTripLite
+		if err = rows.Scan(&t.TripID, &t.DirectionID, &t.Headsign, &t.ShortName, &t.FirstStopID, &t.FirstTime, &t.LastStopID, &t.LastTime, &t.StopCount); err != nil {
+			return nil, fmt.Errorf("scan timetable trip lite static: %w", err)
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
 // ============================================================================
 // Calendar
 // ============================================================================

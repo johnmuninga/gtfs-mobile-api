@@ -1704,6 +1704,15 @@ func (s *Server) handleCalendarTimetableLite(w http.ResponseWriter, r *http.Requ
 		httpError(w, http.StatusInternalServerError, "failed to fetch timetable")
 		return
 	}
+	// Static-data fallback: if calendar/day filter yields no rows, return route timetable from trips+stop_times.
+	if len(trips) == 0 {
+		trips, err = s.repo.ListTimetableTripsLiteStatic(ctx, routeID, directionID, limit, offset)
+		if err != nil {
+			log.Printf("calendar timetable lite static fallback: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to fetch timetable")
+			return
+		}
+	}
 	payload := models.CalendarTimetableLitePayload{
 		Date:      date,
 		RouteID:   routeID,
