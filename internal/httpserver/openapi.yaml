@@ -1475,6 +1475,8 @@ components:
         live_vehicle_count: { type: integer, minimum: 0 }
         has_live_vehicles: { type: boolean }
         last_live_updated_at: { type: string, format: date-time, nullable: true }
+        current_stop: { $ref: "#/components/schemas/FavoriteRouteNextStopPreview" }
+        next_stop: { $ref: "#/components/schemas/FavoriteRouteNextStopPreview" }
         next_two_stops:
           type: array
           maxItems: 2

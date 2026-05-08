@@ -1955,8 +1955,26 @@ func (s *Server) handleTripLive(w http.ResponseWriter, r *http.Request) {
 		var err error
 		tripID, err = s.repo.ResolveTripIDForVehicle(ctx, vehicleID)
 		if errors.Is(err, pgx.ErrNoRows) {
-			httpError(w, http.StatusNotFound, "vehicle has no active trip")
-			return
+			routeID, routeErr := s.repo.ResolveRouteIDForVehicle(ctx, vehicleID)
+			if errors.Is(routeErr, pgx.ErrNoRows) {
+				httpError(w, http.StatusNotFound, "vehicle has no active trip")
+				return
+			}
+			if routeErr != nil {
+				log.Printf("resolve route from vehicle: %v", routeErr)
+				httpError(w, http.StatusInternalServerError, "failed to resolve route")
+				return
+			}
+			tripID, err = s.repo.ResolveUpcomingTripIDForRoute(ctx, routeID, time.Now())
+			if errors.Is(err, pgx.ErrNoRows) {
+				httpError(w, http.StatusNotFound, "no upcoming trip found for vehicle route")
+				return
+			}
+			if err != nil {
+				log.Printf("resolve fallback trip from route: %v", err)
+				httpError(w, http.StatusInternalServerError, "failed to resolve fallback trip")
+				return
+			}
 		}
 		if err != nil {
 			log.Printf("resolve trip from vehicle: %v", err)

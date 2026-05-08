@@ -439,6 +439,8 @@ type FavoriteRoute struct {
 	LiveVehicleCount  int                            `json:"live_vehicle_count,omitempty"`
 	HasLiveVehicles   bool                           `json:"has_live_vehicles,omitempty"`
 	LastLiveUpdatedAt *time.Time                     `json:"last_live_updated_at,omitempty"`
+	CurrentStop       *FavoriteRouteNextStopPreview  `json:"current_stop,omitempty"`
+	NextStop          *FavoriteRouteNextStopPreview  `json:"next_stop,omitempty"`
 	NextTwoStops      []FavoriteRouteNextStopPreview `json:"next_two_stops,omitempty"`
 }
 

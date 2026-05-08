@@ -1103,6 +1103,61 @@ LIMIT 1
 	return tripID, nil
 }
 
+func (r *Repository) ResolveRouteIDForVehicle(ctx context.Context, vehicleID string) (string, error) {
+	const q = `
+SELECT COALESCE(
+	NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+	NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+	''
+)
+FROM vehicle_positions_current v
+LEFT JOIN trips t ON t.trip_id = v.trip_id
+WHERE v.vehicle_id = $1
+ORDER BY COALESCE(v.updated_at, NOW()) DESC
+LIMIT 1
+`
+	var routeID string
+	if err := r.pool.QueryRow(ctx, q, vehicleID).Scan(&routeID); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(routeID) == "" {
+		return "", pgx.ErrNoRows
+	}
+	return routeID, nil
+}
+
+func (r *Repository) ResolveUpcomingTripIDForRoute(ctx context.Context, routeID string, at time.Time) (string, error) {
+	const q = `
+WITH candidate_dates AS (
+	SELECT ($2::timestamptz)::date AS d
+	UNION ALL
+	SELECT (($2::timestamptz)::date - INTERVAL '1 day')::date
+),
+expanded AS (
+	SELECT
+		st.trip_id,
+		(cd.d::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time
+	FROM trips t
+	JOIN stop_times st ON st.trip_id = t.trip_id
+	JOIN candidate_dates cd ON true
+	WHERE t.route_id = $1
+)
+SELECT trip_id
+FROM expanded
+WHERE scheduled_time >= $2::timestamptz
+ORDER BY scheduled_time
+LIMIT 1
+`
+	var tripID string
+	if err := r.pool.QueryRow(ctx, q, routeID, at).Scan(&tripID); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(tripID) == "" {
+		return "", pgx.ErrNoRows
+	}
+	return tripID, nil
+}
+
 // GetTripLiveSnapshot returns route/trip metadata + upcoming stops ETA rows for one trip.
 func (r *Repository) GetTripLiveSnapshot(ctx context.Context, tripID string, at time.Time, limit int) (*models.TripLivePayload, error) {
 	if limit <= 0 {
@@ -1782,20 +1837,28 @@ ORDER BY f.created_at DESC, f.route_id
 	if len(routeIDs) == 0 {
 		return out, nil
 	}
-	nextStopsByRoute, err := r.listFavoriteRouteNextStops(ctx, routeIDs)
+	stopPreviewByRoute, err := r.listFavoriteRouteStopPreviews(ctx, routeIDs)
 	if err != nil {
 		return nil, err
 	}
 	for i := range out {
-		if stops, ok := nextStopsByRoute[out[i].RouteID]; ok {
-			out[i].NextTwoStops = stops
+		if preview, ok := stopPreviewByRoute[out[i].RouteID]; ok {
+			out[i].CurrentStop = preview.CurrentStop
+			out[i].NextStop = preview.NextStop
+			out[i].NextTwoStops = preview.NextTwoStops
 		}
 	}
 	return out, nil
 }
 
-func (r *Repository) listFavoriteRouteNextStops(ctx context.Context, routeIDs []string) (map[string][]models.FavoriteRouteNextStopPreview, error) {
-	out := make(map[string][]models.FavoriteRouteNextStopPreview, len(routeIDs))
+type favoriteRouteStopPreview struct {
+	CurrentStop  *models.FavoriteRouteNextStopPreview
+	NextStop     *models.FavoriteRouteNextStopPreview
+	NextTwoStops []models.FavoriteRouteNextStopPreview
+}
+
+func (r *Repository) listFavoriteRouteStopPreviews(ctx context.Context, routeIDs []string) (map[string]favoriteRouteStopPreview, error) {
+	out := make(map[string]favoriteRouteStopPreview, len(routeIDs))
 	if len(routeIDs) == 0 {
 		return out, nil
 	}
@@ -1827,6 +1890,9 @@ chosen AS (
 	) x
 	WHERE rn = 1
 ),
+at_ts AS (
+	SELECT NOW() AS at
+),
 candidate_dates AS (
 	SELECT CURRENT_DATE AS d
 	UNION ALL
@@ -1851,6 +1917,18 @@ expanded AS (
 		LIMIT 1
 	) rt ON true
 ),
+current_stop AS (
+	SELECT
+		route_id,
+		stop_id,
+		stop_name,
+		stop_sequence,
+		scheduled_time,
+		arrival_delay,
+		ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY scheduled_time DESC, stop_sequence DESC) AS rn
+	FROM expanded
+	WHERE scheduled_time <= (SELECT at FROM at_ts)
+),
 future AS (
 	SELECT
 		route_id,
@@ -1861,20 +1939,28 @@ future AS (
 		arrival_delay,
 		ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY scheduled_time, stop_sequence) AS rn
 	FROM expanded
-	WHERE scheduled_time >= NOW()
+	WHERE scheduled_time >= (SELECT at FROM at_ts)
 )
 SELECT
 	route_id,
 	stop_id,
 	stop_name,
 	scheduled_time,
+	is_current_stop,
 	CASE
 		WHEN arrival_delay IS NULL THEN NULL
 		ELSE scheduled_time + (arrival_delay || ' seconds')::interval
 	END AS estimated_time
-FROM future
-WHERE rn <= 2
-ORDER BY route_id, rn
+FROM (
+	SELECT route_id, stop_id, stop_name, stop_sequence, scheduled_time, arrival_delay, true AS is_current_stop
+	FROM current_stop
+	WHERE rn = 1
+	UNION ALL
+	SELECT route_id, stop_id, stop_name, stop_sequence, scheduled_time, arrival_delay, false AS is_current_stop
+	FROM future
+	WHERE rn <= 2
+) x
+ORDER BY route_id, is_current_stop DESC, scheduled_time, stop_sequence
 `
 	rows, err := r.pool.Query(ctx, q, routeIDs)
 	if err != nil {
@@ -1887,10 +1973,11 @@ ORDER BY route_id, rn
 			routeID       string
 			scheduledTime time.Time
 			estimatedTime sql.NullTime
+			isCurrentStop bool
 			stop          models.FavoriteRouteNextStopPreview
 			baseTime      time.Time
 		)
-		if err = rows.Scan(&routeID, &stop.StopID, &stop.StopName, &scheduledTime, &estimatedTime); err != nil {
+		if err = rows.Scan(&routeID, &stop.StopID, &stop.StopName, &scheduledTime, &isCurrentStop, &estimatedTime); err != nil {
 			return nil, fmt.Errorf("scan favorite next stop: %w", err)
 		}
 		if estimatedTime.Valid {
@@ -1903,10 +1990,24 @@ ORDER BY route_id, rn
 		if stop.ETAMinutes < 0 {
 			stop.ETAMinutes = 0
 		}
-		out[routeID] = append(out[routeID], stop)
+		item := out[routeID]
+		if isCurrentStop {
+			s := stop
+			item.CurrentStop = &s
+		} else if len(item.NextTwoStops) < 2 {
+			item.NextTwoStops = append(item.NextTwoStops, stop)
+		}
+		out[routeID] = item
 	}
 	if err = rows.Err(); err != nil {
 		return nil, err
+	}
+	for routeID, item := range out {
+		if len(item.NextTwoStops) > 0 {
+			s := item.NextTwoStops[0]
+			item.NextStop = &s
+			out[routeID] = item
+		}
 	}
 	return out, nil
 }
