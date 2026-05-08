@@ -1472,6 +1472,22 @@ components:
         long_name: { type: string }
         route_color: { type: string }
         route_text_color: { type: string }
+        live_vehicle_count: { type: integer, minimum: 0 }
+        has_live_vehicles: { type: boolean }
+        last_live_updated_at: { type: string, format: date-time, nullable: true }
+        next_two_stops:
+          type: array
+          maxItems: 2
+          items: { $ref: "#/components/schemas/FavoriteRouteNextStopPreview" }
+
+    FavoriteRouteNextStopPreview:
+      type: object
+      required: [stop_id, eta_minutes, is_realtime]
+      properties:
+        stop_id: { type: string }
+        stop_name: { type: string }
+        eta_minutes: { type: integer, minimum: 0 }
+        is_realtime: { type: boolean }
 
     FavoriteRouteRequest:
       type: object

@@ -431,9 +431,20 @@ type RouteDirection struct {
 }
 
 type FavoriteRoute struct {
-	RouteID        string `json:"route_id"`
-	ShortName      string `json:"short_name,omitempty"`
-	LongName       string `json:"long_name,omitempty"`
-	RouteColor     string `json:"route_color,omitempty"`
-	RouteTextColor string `json:"route_text_color,omitempty"`
+	RouteID           string                         `json:"route_id"`
+	ShortName         string                         `json:"short_name,omitempty"`
+	LongName          string                         `json:"long_name,omitempty"`
+	RouteColor        string                         `json:"route_color,omitempty"`
+	RouteTextColor    string                         `json:"route_text_color,omitempty"`
+	LiveVehicleCount  int                            `json:"live_vehicle_count,omitempty"`
+	HasLiveVehicles   bool                           `json:"has_live_vehicles,omitempty"`
+	LastLiveUpdatedAt *time.Time                     `json:"last_live_updated_at,omitempty"`
+	NextTwoStops      []FavoriteRouteNextStopPreview `json:"next_two_stops,omitempty"`
+}
+
+type FavoriteRouteNextStopPreview struct {
+	StopID     string `json:"stop_id"`
+	StopName   string `json:"stop_name,omitempty"`
+	ETAMinutes int    `json:"eta_minutes"`
+	IsRealtime bool   `json:"is_realtime"`
 }

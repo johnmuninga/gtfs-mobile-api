@@ -2398,7 +2398,7 @@ func (s *Server) handleListFavoriteRoutes(w http.ResponseWriter, r *http.Request
 		Data:   favorites,
 		Meta:   &models.Meta{Total: len(favorites)},
 	}
-	s.cache.SetWithTTL(cacheKey, resp, 20*time.Second)
+	s.cache.SetWithTTL(cacheKey, resp, 5*time.Second)
 	writeJSON(w, http.StatusOK, resp)
 }
 

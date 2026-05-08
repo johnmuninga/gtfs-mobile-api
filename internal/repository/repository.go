@@ -1715,14 +1715,34 @@ LIMIT 48
 // ListFavoriteRoutes returns favorited route ids with lightweight display fields.
 func (r *Repository) ListFavoriteRoutes(ctx context.Context, userID string) ([]models.FavoriteRoute, error) {
 	const q = `
+WITH live_by_route AS (
+	SELECT
+		COALESCE(
+			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+			''
+		) AS route_id,
+		COUNT(*)::int AS live_vehicle_count,
+		MAX(COALESCE(v.updated_at, NOW())) AS last_live_updated_at
+	FROM vehicle_positions_current v
+	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	WHERE v.latitude IS NOT NULL
+	  AND v.longitude IS NOT NULL
+	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+	GROUP BY 1
+)
 SELECT
 	f.route_id,
 	COALESCE(NULLIF(TRIM(r.route_short_name), ''), ''),
 	COALESCE(NULLIF(TRIM(r.route_long_name), ''), ''),
 	COALESCE(NULLIF(TRIM(r.route_color), ''), ''),
-	COALESCE(NULLIF(TRIM(r.route_text_color), ''), '')
+	COALESCE(NULLIF(TRIM(r.route_text_color), ''), ''),
+	COALESCE(l.live_vehicle_count, 0) AS live_vehicle_count,
+	CASE WHEN COALESCE(l.live_vehicle_count, 0) > 0 THEN true ELSE false END AS has_live_vehicles,
+	l.last_live_updated_at
 FROM user_favorite_routes f
 LEFT JOIN routes r ON r.route_id = f.route_id
+LEFT JOIN live_by_route l ON l.route_id = f.route_id
 WHERE f.user_id = $1::uuid
 ORDER BY f.created_at DESC, f.route_id
 `
@@ -1733,14 +1753,162 @@ ORDER BY f.created_at DESC, f.route_id
 	defer rows.Close()
 
 	out := make([]models.FavoriteRoute, 0, 16)
+	routeIDs := make([]string, 0, 16)
 	for rows.Next() {
 		var f models.FavoriteRoute
-		if err = rows.Scan(&f.RouteID, &f.ShortName, &f.LongName, &f.RouteColor, &f.RouteTextColor); err != nil {
+		var lastLiveUpdatedAt sql.NullTime
+		if err = rows.Scan(
+			&f.RouteID,
+			&f.ShortName,
+			&f.LongName,
+			&f.RouteColor,
+			&f.RouteTextColor,
+			&f.LiveVehicleCount,
+			&f.HasLiveVehicles,
+			&lastLiveUpdatedAt,
+		); err != nil {
 			return nil, fmt.Errorf("scan favorite route: %w", err)
 		}
+		if lastLiveUpdatedAt.Valid {
+			t := lastLiveUpdatedAt.Time
+			f.LastLiveUpdatedAt = &t
+		}
 		out = append(out, f)
+		routeIDs = append(routeIDs, f.RouteID)
 	}
-	return out, rows.Err()
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(routeIDs) == 0 {
+		return out, nil
+	}
+	nextStopsByRoute, err := r.listFavoriteRouteNextStops(ctx, routeIDs)
+	if err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if stops, ok := nextStopsByRoute[out[i].RouteID]; ok {
+			out[i].NextTwoStops = stops
+		}
+	}
+	return out, nil
+}
+
+func (r *Repository) listFavoriteRouteNextStops(ctx context.Context, routeIDs []string) (map[string][]models.FavoriteRouteNextStopPreview, error) {
+	out := make(map[string][]models.FavoriteRouteNextStopPreview, len(routeIDs))
+	if len(routeIDs) == 0 {
+		return out, nil
+	}
+	const q = `
+WITH live AS (
+	SELECT
+		COALESCE(
+			NULLIF(TRIM(COALESCE(v.route_id, '')), ''),
+			NULLIF(TRIM(COALESCE(t.route_id, '')), ''),
+			''
+		) AS route_id,
+		COALESCE(v.trip_id, '') AS trip_id,
+		COALESCE(v.updated_at, NOW()) AS updated_at
+	FROM vehicle_positions_current v
+	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	WHERE v.latitude IS NOT NULL
+	  AND v.longitude IS NOT NULL
+	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+),
+chosen AS (
+	SELECT route_id, trip_id
+	FROM (
+		SELECT
+			route_id,
+			trip_id,
+			ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY updated_at DESC) AS rn
+		FROM live
+		WHERE route_id = ANY($1::text[]) AND trip_id <> ''
+	) x
+	WHERE rn = 1
+),
+candidate_dates AS (
+	SELECT CURRENT_DATE AS d
+	UNION ALL
+	SELECT (CURRENT_DATE - INTERVAL '1 day')::date
+),
+expanded AS (
+	SELECT
+		c.route_id,
+		st.stop_id,
+		COALESCE(s.stop_name, '') AS stop_name,
+		st.stop_sequence,
+		(cd.d::timestamp + st.arrival_time::interval) AT TIME ZONE current_setting('TimeZone') AS scheduled_time,
+		rt.arrival_delay
+	FROM chosen c
+	JOIN stop_times st ON st.trip_id = c.trip_id
+	JOIN candidate_dates cd ON true
+	LEFT JOIN stops s ON s.stop_id = st.stop_id
+	LEFT JOIN LATERAL (
+		SELECT rt_inner.arrival_delay
+		FROM trip_update_stop_times_current rt_inner
+		WHERE rt_inner.trip_id = c.trip_id AND rt_inner.stop_id = st.stop_id
+		LIMIT 1
+	) rt ON true
+),
+future AS (
+	SELECT
+		route_id,
+		stop_id,
+		stop_name,
+		stop_sequence,
+		scheduled_time,
+		arrival_delay,
+		ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY scheduled_time, stop_sequence) AS rn
+	FROM expanded
+	WHERE scheduled_time >= NOW()
+)
+SELECT
+	route_id,
+	stop_id,
+	stop_name,
+	scheduled_time,
+	CASE
+		WHEN arrival_delay IS NULL THEN NULL
+		ELSE scheduled_time + (arrival_delay || ' seconds')::interval
+	END AS estimated_time
+FROM future
+WHERE rn <= 2
+ORDER BY route_id, rn
+`
+	rows, err := r.pool.Query(ctx, q, routeIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query favorite next stops: %w", err)
+	}
+	defer rows.Close()
+	now := time.Now()
+	for rows.Next() {
+		var (
+			routeID       string
+			scheduledTime time.Time
+			estimatedTime sql.NullTime
+			stop          models.FavoriteRouteNextStopPreview
+			baseTime      time.Time
+		)
+		if err = rows.Scan(&routeID, &stop.StopID, &stop.StopName, &scheduledTime, &estimatedTime); err != nil {
+			return nil, fmt.Errorf("scan favorite next stop: %w", err)
+		}
+		if estimatedTime.Valid {
+			stop.IsRealtime = true
+			baseTime = estimatedTime.Time
+		} else {
+			baseTime = scheduledTime
+		}
+		stop.ETAMinutes = int(baseTime.Sub(now).Minutes())
+		if stop.ETAMinutes < 0 {
+			stop.ETAMinutes = 0
+		}
+		out[routeID] = append(out[routeID], stop)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // AddFavoriteRoute inserts one (user_id, route_id) pair, ignoring duplicates.
