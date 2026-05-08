@@ -260,6 +260,19 @@ type TripLivePayload struct {
 	UpdatedAt      *time.Time        `json:"updated_at,omitempty"`
 }
 
+type ETABetweenStopsPayload struct {
+	VehicleID              string `json:"vehicle_id,omitempty"`
+	TripID                 string `json:"trip_id"`
+	FromStopID             string `json:"from_stop_id"`
+	FromStopName           string `json:"from_stop_name,omitempty"`
+	ToStopID               string `json:"to_stop_id"`
+	ToStopName             string `json:"to_stop_name,omitempty"`
+	FromStopETA            int    `json:"eta_to_from_stop_minutes"`
+	ToStopETA              int    `json:"eta_to_to_stop_minutes"`
+	BetweenStopsETAMinutes int    `json:"between_stops_minutes"`
+	IsRealtime             bool   `json:"is_realtime"`
+}
+
 type Trip struct {
 	TripID       string `json:"trip_id"`
 	RouteID      string `json:"route_id,omitempty"`
@@ -418,5 +431,9 @@ type RouteDirection struct {
 }
 
 type FavoriteRoute struct {
-	RouteID string `json:"route_id"`
+	RouteID        string `json:"route_id"`
+	ShortName      string `json:"short_name,omitempty"`
+	LongName       string `json:"long_name,omitempty"`
+	RouteColor     string `json:"route_color,omitempty"`
+	RouteTextColor string `json:"route_text_color,omitempty"`
 }

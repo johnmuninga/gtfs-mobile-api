@@ -1712,13 +1712,19 @@ LIMIT 48
 	return out, rows.Err()
 }
 
-// ListFavoriteRoutes returns all route ids favorited by user_id.
+// ListFavoriteRoutes returns favorited route ids with lightweight display fields.
 func (r *Repository) ListFavoriteRoutes(ctx context.Context, userID string) ([]models.FavoriteRoute, error) {
 	const q = `
-SELECT route_id
-FROM user_favorite_routes
-WHERE user_id = $1::uuid
-ORDER BY created_at DESC, route_id
+SELECT
+	f.route_id,
+	COALESCE(NULLIF(TRIM(r.route_short_name), ''), ''),
+	COALESCE(NULLIF(TRIM(r.route_long_name), ''), ''),
+	COALESCE(NULLIF(TRIM(r.route_color), ''), ''),
+	COALESCE(NULLIF(TRIM(r.route_text_color), ''), '')
+FROM user_favorite_routes f
+LEFT JOIN routes r ON r.route_id = f.route_id
+WHERE f.user_id = $1::uuid
+ORDER BY f.created_at DESC, f.route_id
 `
 	rows, err := r.pool.Query(ctx, q, userID)
 	if err != nil {
@@ -1729,7 +1735,7 @@ ORDER BY created_at DESC, route_id
 	out := make([]models.FavoriteRoute, 0, 16)
 	for rows.Next() {
 		var f models.FavoriteRoute
-		if err = rows.Scan(&f.RouteID); err != nil {
+		if err = rows.Scan(&f.RouteID, &f.ShortName, &f.LongName, &f.RouteColor, &f.RouteTextColor); err != nil {
 			return nil, fmt.Errorf("scan favorite route: %w", err)
 		}
 		out = append(out, f)

@@ -140,6 +140,7 @@ func (s *Server) Router() http.Handler {
 	// Realtime
 	mux.HandleFunc("GET /v1/map/vehicles", s.handleVehicles)
 	mux.HandleFunc("GET /v1/map/trip-live", s.handleTripLive)
+	mux.HandleFunc("GET /v1/map/eta-between-stops", s.handleETABetweenStops)
 	mux.HandleFunc("GET /v1/map/vehicles/live", s.handleVehiclesLive)
 	mux.HandleFunc("POST /v1/vehicle-position", s.handleVehiclePositionIngest)
 	mux.HandleFunc("GET /v1/map/routes-with-live-vehicles", s.handleRoutesWithLiveVehicles)
@@ -2002,6 +2003,101 @@ func (s *Server) handleTripLive(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleETABetweenStops(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	q := r.URL.Query()
+	tripID := strings.TrimSpace(q.Get("tripId"))
+	vehicleID := strings.TrimSpace(q.Get("vehicleId"))
+	fromStopID := strings.TrimSpace(q.Get("fromStopId"))
+	toStopID := strings.TrimSpace(q.Get("toStopId"))
+	if (tripID == "" && vehicleID == "") || fromStopID == "" || toStopID == "" {
+		httpError(w, http.StatusBadRequest, "tripId or vehicleId and both fromStopId/toStopId are required")
+		return
+	}
+	if tripID == "" {
+		var err error
+		tripID, err = s.repo.ResolveTripIDForVehicle(ctx, vehicleID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpError(w, http.StatusNotFound, "vehicle has no active trip")
+			return
+		}
+		if err != nil {
+			log.Printf("resolve trip from vehicle: %v", err)
+			httpError(w, http.StatusInternalServerError, "failed to resolve trip")
+			return
+		}
+	}
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	cacheKey := "eta_between:" + tripID + "|" + fromStopID + "|" + toStopID
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
+
+	payload, err := s.repo.GetTripLiveSnapshot(ctx, tripID, time.Now(), 50)
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpError(w, http.StatusNotFound, "trip not found")
+		return
+	}
+	if err != nil {
+		log.Printf("eta between stops: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to compute eta")
+		return
+	}
+
+	fromIdx, toIdx := -1, -1
+	for i := range payload.UpcomingStops {
+		if payload.UpcomingStops[i].StopID == fromStopID && fromIdx < 0 {
+			fromIdx = i
+		}
+		if payload.UpcomingStops[i].StopID == toStopID && toIdx < 0 {
+			toIdx = i
+		}
+	}
+	if fromIdx < 0 || toIdx < 0 {
+		httpError(w, http.StatusNotFound, "requested stops not found in upcoming trip segment")
+		return
+	}
+	if toIdx < fromIdx {
+		httpError(w, http.StatusBadRequest, "toStopId must be after fromStopId on upcoming trip segment")
+		return
+	}
+
+	fromETA := payload.UpcomingStops[fromIdx].ETAMinutes
+	toETA := payload.UpcomingStops[toIdx].ETAMinutes
+	out := models.ETABetweenStopsPayload{
+		VehicleID:              payload.VehicleID,
+		TripID:                 payload.TripID,
+		FromStopID:             fromStopID,
+		FromStopName:           payload.UpcomingStops[fromIdx].StopName,
+		ToStopID:               toStopID,
+		ToStopName:             payload.UpcomingStops[toIdx].StopName,
+		FromStopETA:            fromETA,
+		ToStopETA:              toETA,
+		BetweenStopsETAMinutes: toETA - fromETA,
+		IsRealtime:             payload.UpcomingStops[fromIdx].IsRealtime || payload.UpcomingStops[toIdx].IsRealtime,
+	}
+	if out.BetweenStopsETAMinutes < 0 {
+		out.BetweenStopsETAMinutes = 0
+	}
+	resp := models.ResponseEnvelope{
+		Status: status,
+		Data:   out,
+	}
+	s.cache.SetWithTTL(cacheKey, resp, vehiclesCacheTTL)
+	writeJSON(w, http.StatusOK, resp)
+}
+
 // handleRealtimeTripUpdates returns rows from REALTIME_TRIP_UPDATES_TABLE (default trip_updates_current)
 // as a JSON array so any column layout from your ingest pipeline is forwarded to the app.
 func (s *Server) handleRealtimeTripUpdates(w http.ResponseWriter, r *http.Request) {
@@ -2283,17 +2379,27 @@ func (s *Server) handleListFavoriteRoutes(w http.ResponseWriter, r *http.Request
 		httpError(w, http.StatusUnauthorized, err.Error())
 		return
 	}
+
+	cacheKey := "favorite_routes:" + userID
+	if cached, ok := s.cache.Get(cacheKey); ok {
+		if env, ok := cached.(models.ResponseEnvelope); ok {
+			writeJSON(w, http.StatusOK, env)
+			return
+		}
+	}
 	favorites, err := s.repo.ListFavoriteRoutes(ctx, userID)
 	if err != nil {
 		log.Printf("list favorite routes: %v", err)
 		httpError(w, http.StatusInternalServerError, "failed to list favorite routes")
 		return
 	}
-	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+	resp := models.ResponseEnvelope{
 		Status: models.APIStatus{Mode: models.ModeNormal},
 		Data:   favorites,
 		Meta:   &models.Meta{Total: len(favorites)},
-	})
+	}
+	s.cache.SetWithTTL(cacheKey, resp, 20*time.Second)
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) handleAddFavoriteRoute(w http.ResponseWriter, r *http.Request) {
@@ -2320,6 +2426,7 @@ func (s *Server) handleAddFavoriteRoute(w http.ResponseWriter, r *http.Request) 
 		httpError(w, http.StatusInternalServerError, "failed to add favorite route")
 		return
 	}
+	s.cache.Invalidate("favorite_routes:" + userID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -2342,6 +2449,7 @@ func (s *Server) handleDeleteFavoriteRoute(w http.ResponseWriter, r *http.Reques
 		httpError(w, http.StatusInternalServerError, "failed to delete favorite route")
 		return
 	}
+	s.cache.Invalidate("favorite_routes:" + userID)
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
