@@ -1917,18 +1917,6 @@ expanded AS (
 		LIMIT 1
 	) rt ON true
 ),
-current_stop AS (
-	SELECT
-		route_id,
-		stop_id,
-		stop_name,
-		stop_sequence,
-		scheduled_time,
-		arrival_delay,
-		ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY scheduled_time DESC, stop_sequence DESC) AS rn
-	FROM expanded
-	WHERE scheduled_time <= (SELECT at FROM at_ts)
-),
 future AS (
 	SELECT
 		route_id,
@@ -1946,21 +1934,13 @@ SELECT
 	stop_id,
 	stop_name,
 	scheduled_time,
-	is_current_stop,
 	CASE
 		WHEN arrival_delay IS NULL THEN NULL
 		ELSE scheduled_time + (arrival_delay || ' seconds')::interval
 	END AS estimated_time
-FROM (
-	SELECT route_id, stop_id, stop_name, stop_sequence, scheduled_time, arrival_delay, true AS is_current_stop
-	FROM current_stop
-	WHERE rn = 1
-	UNION ALL
-	SELECT route_id, stop_id, stop_name, stop_sequence, scheduled_time, arrival_delay, false AS is_current_stop
-	FROM future
-	WHERE rn <= 2
-) x
-ORDER BY route_id, is_current_stop DESC, scheduled_time, stop_sequence
+FROM future
+WHERE rn <= 2
+ORDER BY route_id, scheduled_time, stop_sequence
 `
 	rows, err := r.pool.Query(ctx, q, routeIDs)
 	if err != nil {
@@ -1973,11 +1953,10 @@ ORDER BY route_id, is_current_stop DESC, scheduled_time, stop_sequence
 			routeID       string
 			scheduledTime time.Time
 			estimatedTime sql.NullTime
-			isCurrentStop bool
 			stop          models.FavoriteRouteNextStopPreview
 			baseTime      time.Time
 		)
-		if err = rows.Scan(&routeID, &stop.StopID, &stop.StopName, &scheduledTime, &isCurrentStop, &estimatedTime); err != nil {
+		if err = rows.Scan(&routeID, &stop.StopID, &stop.StopName, &scheduledTime, &estimatedTime); err != nil {
 			return nil, fmt.Errorf("scan favorite next stop: %w", err)
 		}
 		if estimatedTime.Valid {
@@ -1991,10 +1970,7 @@ ORDER BY route_id, is_current_stop DESC, scheduled_time, stop_sequence
 			stop.ETAMinutes = 0
 		}
 		item := out[routeID]
-		if isCurrentStop {
-			s := stop
-			item.CurrentStop = &s
-		} else if len(item.NextTwoStops) < 2 {
+		if len(item.NextTwoStops) < 2 {
 			item.NextTwoStops = append(item.NextTwoStops, stop)
 		}
 		out[routeID] = item
@@ -2004,10 +1980,14 @@ ORDER BY route_id, is_current_stop DESC, scheduled_time, stop_sequence
 	}
 	for routeID, item := range out {
 		if len(item.NextTwoStops) > 0 {
-			s := item.NextTwoStops[0]
-			item.NextStop = &s
-			out[routeID] = item
+			current := item.NextTwoStops[0]
+			item.CurrentStop = &current
 		}
+		if len(item.NextTwoStops) > 1 {
+			next := item.NextTwoStops[1]
+			item.NextStop = &next
+		}
+		out[routeID] = item
 	}
 	return out, nil
 }
