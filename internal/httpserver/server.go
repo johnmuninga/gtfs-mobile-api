@@ -119,6 +119,7 @@ func (s *Server) Router() http.Handler {
 	mux.Handle("GET /v1/gtfs/calendar/exceptions", staticCache(http.HandlerFunc(s.handleCalendarExceptions)))
 	mux.Handle("GET /v1/gtfs/calendar/day", staticCache(http.HandlerFunc(s.handleCalendarDay)))
 	mux.Handle("GET /v1/gtfs/calendar/timetable-lite", staticCache(http.HandlerFunc(s.handleCalendarTimetableLite)))
+	mux.Handle("GET /v1/gtfs/calendar/timetable-trip-stops", staticCache(http.HandlerFunc(s.handleCalendarTimetableTripStops)))
 	mux.Handle("GET /v1/gtfs/calendar/{serviceId}", staticCache(http.HandlerFunc(s.handleGetCalendarService)))
 	mux.Handle("GET /v1/gtfs/calendar", staticCache(http.HandlerFunc(s.handleListCalendar)))
 
@@ -1732,6 +1733,67 @@ func (s *Server) handleCalendarTimetableLite(w http.ResponseWriter, r *http.Requ
 	}
 	s.cache.SetWithTTL(cacheKey, resp, 45*time.Second)
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleCalendarTimetableTripStops returns full ordered stop_times for one trip (static schedule).
+// Query: tripId=required, routeId=optional (must match trip), date=optional (echo only for client cache keys).
+func (s *Server) handleCalendarTimetableTripStops(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	tripID := strings.TrimSpace(q.Get("tripId"))
+	if tripID == "" {
+		httpError(w, http.StatusBadRequest, "tripId is required")
+		return
+	}
+	routeID := strings.TrimSpace(q.Get("routeId"))
+	date := strings.TrimSpace(q.Get("date"))
+	if date != "" {
+		if _, err := time.Parse("2006-01-02", date); err != nil {
+			httpError(w, http.StatusBadRequest, "invalid date (use YYYY-MM-DD)")
+			return
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
+	defer cancel()
+
+	status, err := s.repo.GetAPIStatus(ctx, s.cfg.APIDegradedMinutes)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "failed to read feed state")
+		return
+	}
+
+	trip, err := s.repo.GetTrip(ctx, tripID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpError(w, http.StatusNotFound, "trip not found")
+		return
+	}
+	if err != nil {
+		log.Printf("calendar timetable trip stops get trip: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load trip")
+		return
+	}
+	if routeID != "" && trip.RouteID != routeID {
+		httpError(w, http.StatusBadRequest, "tripId does not belong to routeId")
+		return
+	}
+
+	stops, err := s.repo.GetTripStopTimes(ctx, tripID)
+	if err != nil {
+		log.Printf("calendar timetable trip stops: %v", err)
+		httpError(w, http.StatusInternalServerError, "failed to load stop times")
+		return
+	}
+
+	payload := models.CalendarTimetableTripStopsPayload{
+		Date:  date,
+		Trip:  *trip,
+		Stops: stops,
+	}
+	writeJSON(w, http.StatusOK, models.ResponseEnvelope{
+		Status: status,
+		Data:   payload,
+		Meta:   &models.Meta{Total: len(stops)},
+	})
 }
 
 func (s *Server) handleFeedActive(w http.ResponseWriter, r *http.Request) {

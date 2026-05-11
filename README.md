@@ -36,6 +36,7 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 - `GET /v1/routes` - route list from `routes`
 - `GET /v1/gtfs/routes/{routeId}/stops?directionId=0&lite=1` - compact stops payload (`stop_ids` + `stops` dictionary) for faster route-stop rendering
 - `GET /v1/gtfs/calendar/timetable-lite?date=YYYY-MM-DD&routeId=...` - one lightweight call for route/day timetable rows (trip + first/last times + stop_count)
+- `GET /v1/gtfs/calendar/timetable-trip-stops?tripId=...&routeId=...&date=...` - full ordered stop list for one trip (`stop_sequence`, times, names) for calendar detail; merge with `GET /v1/map/trip-live?tripId=...` for live ETAs
 - `GET /v1/stops/{id}/schedule` - next 5 departures, realtime fallback to static
 - `GET /v1/stops/nearby?lat={lat}&lon={lon}&radius_meters={r}` - nearby stop search
 - `GET /swagger` - Swagger UI

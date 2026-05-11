@@ -544,6 +544,7 @@ paths:
         Lightweight single-call payload for calendar/timetable screens.
         Returns trip rows for a route on a specific date with first/last stop times and stop counts.
         If no active services exist for the date, falls back to static `trips + stop_times` for that route.
+        For the full stop-by-stop list after the user selects a trip, use `GET /v1/gtfs/calendar/timetable-trip-stops`.
       parameters:
         - in: query
           name: date
@@ -573,6 +574,38 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+
+  /v1/gtfs/calendar/timetable-trip-stops:
+    get:
+      tags: [Calendar]
+      summary: Full static stop sequence for one trip (calendar detail)
+      description: |
+        After the user picks a trip from `timetable-lite`, call this to render the full itinerary:
+        every `stop_sequence` with `arrival_time` / `departure_time` and stop names from static GTFS.
+        For live ETAs on top of this list, use `GET /v1/map/trip-live` with the same `trip_id`.
+      parameters:
+        - in: query
+          name: tripId
+          required: true
+          schema: { type: string }
+        - in: query
+          name: routeId
+          description: Optional; if set, must match the trip's route_id (safety check).
+          schema: { type: string }
+        - in: query
+          name: date
+          description: Optional YYYY-MM-DD echo for client cache keys (does not filter rows).
+          schema: { type: string, format: date }
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CalendarTimetableTripStopsResponse" }
+        "400":
+          description: Missing tripId or route mismatch
+        "404":
+          description: Trip not found
 
   /v1/gtfs/calendar:
     get:
@@ -1416,6 +1449,23 @@ components:
       properties:
         status: { $ref: "#/components/schemas/APIStatus" }
         data: { $ref: "#/components/schemas/CalendarTimetableLitePayload" }
+        meta: { $ref: "#/components/schemas/Meta" }
+
+    CalendarTimetableTripStopsPayload:
+      type: object
+      required: [trip, stops]
+      properties:
+        date: { type: string, format: date, description: Echo from query when provided }
+        trip: { $ref: "#/components/schemas/Trip" }
+        stops:
+          type: array
+          items: { $ref: "#/components/schemas/TripStopTime" }
+
+    CalendarTimetableTripStopsResponse:
+      type: object
+      properties:
+        status: { $ref: "#/components/schemas/APIStatus" }
+        data: { $ref: "#/components/schemas/CalendarTimetableTripStopsPayload" }
         meta: { $ref: "#/components/schemas/Meta" }
 
     CalendarDayResponse:

@@ -380,6 +380,14 @@ type CalendarTimetableLitePayload struct {
 	Trips     []TimetableTripLite `json:"trips"`
 }
 
+// CalendarTimetableTripStopsPayload is GET /v1/gtfs/calendar/timetable-trip-stops:
+// full static stop sequence for one trip (calendar detail after picking a row from timetable-lite).
+type CalendarTimetableTripStopsPayload struct {
+	Date  string         `json:"date,omitempty"` // YYYY-MM-DD echo from query when provided
+	Trip  Trip           `json:"trip"`
+	Stops []TripStopTime `json:"stops"`
+}
+
 // FeedCalendarWindow is min/max dates across calendar + calendar_dates (static GTFS coverage).
 type FeedCalendarWindow struct {
 	MinDate string `json:"min_date"` // YYYY-MM-DD
