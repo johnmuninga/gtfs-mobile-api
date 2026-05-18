@@ -940,7 +940,9 @@ paths:
         Each vehicle includes canonical `route_id` (static `routes.route_id`), resolved from the realtime row or from `trips` via `trip_id`, plus `route_short_name` / `route_long_name` from `routes` when the route exists.
         Only rows updated in the last 2 minutes are returned.
 
-        By default (`inferRoute` omitted or true), vehicles the feed left unassigned get `route_id` filled from nearest-stop + shape-distance heuristics (same family as `unassigned_hints`); `route_inferred: true` marks those rows. Send `inferRoute=0` or `false` to skip that pass (faster).
+        **Logged-on only:** vehicles without a non-empty `trip_id` that exists in GTFS `trips` are excluded (position-only rows are not shown on the map).
+
+        By default (`inferRoute` omitted or true), vehicles missing `route_id` but with a valid `trip_id` may get `route_id` filled from nearest-stop + shape-distance heuristics; `route_inferred: true` marks those rows. Send `inferRoute=0` or `false` to skip that pass (faster).
       parameters:
         - in: query
           name: inferRoute

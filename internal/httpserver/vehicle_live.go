@@ -188,6 +188,9 @@ func (s *Server) handleVehiclePositionIngest(w http.ResponseWriter, r *http.Requ
 	// Drop short-lived vehicle caches so next REST reads see latest state.
 	s.cache.Invalidate("vehicles_payload:infer=true")
 	s.cache.Invalidate("vehicles_payload:infer=false")
-	s.live.broadcast(vehicleLiveEvent{Type: "vehicle.upsert", TS: time.Now().UTC(), Vehicle: v})
+	// Only push to map clients when the vehicle is logged on to a GTFS trip.
+	if body.TripID != "" {
+		s.live.broadcast(vehicleLiveEvent{Type: "vehicle.upsert", TS: time.Now().UTC(), Vehicle: v})
+	}
 	writeJSON(w, http.StatusAccepted, map[string]string{"status": "ok"})
 }

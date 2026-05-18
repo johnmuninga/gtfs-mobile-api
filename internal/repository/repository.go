@@ -1780,10 +1780,11 @@ WITH live_by_route AS (
 		COUNT(*)::int AS live_vehicle_count,
 		MAX(COALESCE(v.updated_at, NOW())) AS last_live_updated_at
 	FROM vehicle_positions_current v
-	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	INNER JOIN trips t ON t.trip_id = v.trip_id
 	WHERE v.latitude IS NOT NULL
 	  AND v.longitude IS NOT NULL
 	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+` + sqlVehicleLoggedOnTrip + `
 	GROUP BY 1
 )
 SELECT
@@ -1873,10 +1874,11 @@ WITH live AS (
 		COALESCE(v.trip_id, '') AS trip_id,
 		COALESCE(v.updated_at, NOW()) AS updated_at
 	FROM vehicle_positions_current v
-	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	INNER JOIN trips t ON t.trip_id = v.trip_id
 	WHERE v.latitude IS NOT NULL
 	  AND v.longitude IS NOT NULL
 	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+` + sqlVehicleLoggedOnTrip + `
 ),
 chosen AS (
 	SELECT route_id, trip_id
@@ -1886,7 +1888,7 @@ chosen AS (
 			trip_id,
 			ROW_NUMBER() OVER (PARTITION BY route_id ORDER BY updated_at DESC) AS rn
 		FROM live
-		WHERE route_id = ANY($1::text[]) AND trip_id <> ''
+		WHERE route_id = ANY($1::text[])
 	) x
 	WHERE rn = 1
 ),
@@ -2020,6 +2022,12 @@ WHERE user_id = $1::uuid AND route_id = $2
 // Vehicles (realtime)
 // ============================================================================
 
+// sqlVehicleLoggedOnTrip requires a non-empty trip_id that exists in GTFS trips (driver logged on).
+const sqlVehicleLoggedOnTrip = `
+	  AND NULLIF(TRIM(COALESCE(v.trip_id, '')), '') IS NOT NULL
+	  AND EXISTS (SELECT 1 FROM trips t_chk WHERE t_chk.trip_id = v.trip_id)
+`
+
 func (r *Repository) GetVehicles(ctx context.Context) ([]models.Vehicle, error) {
 	// Canonical route_id: realtime row first, else trips.route_id; names from routes table.
 	const q = `
@@ -2050,10 +2058,11 @@ FROM (
 		v.speed,
 		COALESCE(v.updated_at, NOW()) AS updated_at
 	FROM vehicle_positions_current v
-	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	INNER JOIN trips t ON t.trip_id = v.trip_id
 	WHERE v.latitude IS NOT NULL
 	  AND v.longitude IS NOT NULL
 	  AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+` + sqlVehicleLoggedOnTrip + `
 ) x
 LEFT JOIN routes r ON r.route_id = x.route_id AND x.route_id <> ''
 `
@@ -2215,10 +2224,11 @@ WITH resolved AS (
 			''
 		) AS route_id
 	FROM vehicle_positions_current v
-	LEFT JOIN trips t ON t.trip_id = v.trip_id
+	INNER JOIN trips t ON t.trip_id = v.trip_id
 WHERE v.latitude IS NOT NULL
   AND v.longitude IS NOT NULL
   AND COALESCE(v.updated_at, NOW()) >= NOW() - INTERVAL '2 minutes'
+` + sqlVehicleLoggedOnTrip + `
 )
 `
 	var out models.RoutesWithLiveVehiclesPayload

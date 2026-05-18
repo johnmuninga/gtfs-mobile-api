@@ -20,12 +20,12 @@ Access control is not a substitute for safe SQL: this service uses parameterized
 
 ## Endpoints
 
-- `GET /v1/map/vehicles` - active vehicles; canonical `route_id` (realtime row or `trips.route_id`), plus `route_short_name` / `route_long_name` from static `routes` when the route exists
+- `GET /v1/map/vehicles` - active vehicles **with a valid GTFS `trip_id` only** (logged-on buses); canonical `route_id` from realtime row or `trips`, plus route display names when available
 - `GET /v1/map/trip-live?tripId=...` (or `vehicleId=...`) - trip snapshot for detail screen with `upcoming_stops[]` (`scheduled_time`, nullable `estimated_time`, `eta_minutes`, `is_realtime`)
 - `GET /v1/map/eta-between-stops?vehicleId=...&fromStopId=...&toStopId=...` (or `tripId=...`) - ETA to each stop and `between_stops_minutes` based on current upcoming trip segment
 - `GET /v1/map/vehicles/live` - WebSocket stream of `vehicle.upsert` events (initial snapshot + incremental updates)
 - `POST /v1/vehicle-position` - trusted ingest endpoint to upsert GPS and push live updates to WebSocket clients
-- `GET /v1/map/routes-with-live-vehicles` - `{ routes, unassigned_vehicle_count, total_vehicles }` for route picker; add `?includeUnassignedHints=1` (optional `maxUnassignedHints=80`) to append `unassigned_hints` with lat/lon and **heuristic** `possible_route_ids` from the nearest stop (UI hint only). Full positions for all buses (including unassigned) remain on `GET /v1/map/vehicles`
+- `GET /v1/map/routes-with-live-vehicles` - per-route live counts for **logged-on** vehicles only (`trip_id` required); optional `includeUnassignedHints` is for diagnostics (vehicles without route), not shown on the main map
 - `GET /v1/map/routes-normalized?routeIds=...` - mobile-optimized relational map payload: `routes`/`stops` dictionaries, `junctions` (`route_id -> stop_id[]`), and `route_geometries` as encoded polylines
 - `GET /v1/map/stops-normalized?lat=...&lon=...&limit=...&cursor=...` - stop dictionary (`stops`) plus ordered `stop_ids` for low-overhead map/list rendering
 - `GET /v1/map/arrivals-normalized?stopIds=...&limit=500&cursor=...` - stop-indexed, pre-sorted arrivals for list rendering; cursor pagination via `meta.next_cursor`
